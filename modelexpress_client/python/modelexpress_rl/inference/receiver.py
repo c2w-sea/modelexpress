@@ -76,6 +76,15 @@ class ReceiverInstallError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class DeltaChange:
+    """Checkpoint tensor names one delta changes from its exact base."""
+
+    base_version: str
+    version: str
+    tensor_names: frozenset[str]
+
+
+@dataclass(frozen=True)
 class PreparedCheckpoint:
     """One verified host-local checkpoint ready for engine installation."""
 
@@ -83,6 +92,8 @@ class PreparedCheckpoint:
     path: Path
     metrics: dict[str, float]
     streaming: StreamedCheckpoint | None = None
+    # Deltas from the target's full root, oldest first; empty when unknown.
+    delta_changes: tuple[DeltaChange, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -670,6 +681,8 @@ class _LocalCheckpoint:
     ) -> PreparedCheckpoint | None:
         if state.version != target.version_id:
             return None
+        # Read before eviction can remove the delta artifacts that record it.
+        delta_changes = self._delta_changes(target.version_id)
         # Followers reach this after the lock holder has reconstructed the
         # target. Source identity prevents attaching to a reused UID artifact.
         self.store.enforce_capacity(
@@ -687,7 +700,31 @@ class _LocalCheckpoint:
                 "perf/mx_receive_delta_download": 0.0,
                 "perf/mx_receive_delta_apply": 0.0,
             },
+            delta_changes=delta_changes,
         )
+
+    def _delta_changes(self, version_id: str) -> tuple[DeltaChange, ...]:
+        """Changed names per delta from the full root, or ``()`` if unknown."""
+        chain = self.store.chain(version_id)
+        if chain is None:
+            return ()
+        changes = []
+        base = chain["full_version"]
+        for delta in chain["deltas"]:
+            indexes = list(self.store.delta_path(delta).glob("*.index.json"))
+            if len(indexes) != 1:
+                return ()
+            try:
+                index = json.loads(indexes[0].read_text())
+            except (OSError, ValueError):
+                return ()
+            weight_map = index.get("weight_map")
+            metadata = index.get("metadata") or {}
+            if not isinstance(weight_map, dict) or metadata.get("base_version") != base:
+                return ()
+            changes.append(DeltaChange(base, delta, frozenset(weight_map)))
+            base = delta
+        return tuple(changes)
 
     def _download_replay_manifests(
         self,
@@ -803,6 +840,7 @@ class _LocalCheckpoint:
                 "perf/mx_receive_delta_download": download_time,
                 "perf/mx_receive_delta_apply": apply_time,
             },
+            delta_changes=self._delta_changes(target.version_id),
         )
 
     def _artifact_path(self, version: _S3Version) -> Path:
