@@ -15,6 +15,7 @@ from pathlib import Path
 import torch
 from torch import nn
 
+from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.checkpoint_selection import (
     DependencyGroup,
     read_selected_tensors,
@@ -47,6 +48,13 @@ class _Unsupported(Exception):
 def _require(condition: bool, reason: str) -> None:
     if not condition:
         raise _Unsupported(reason)
+
+
+def _unaudited_runtime_allowed() -> bool:
+    if not rl_envs.MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME:
+        return False
+    logger.warning("Partial checkpoint audit of the vLLM runtime is skipped")
+    return True
 
 
 def _layout(tensor: torch.Tensor) -> tuple:
@@ -119,7 +127,10 @@ def _contract():
     from vllm.model_executor.models.deepseek_v2 import DeepseekV2MLAAttention
     from vllm.version import __version__
 
-    _require(__version__ == "0.19.0", "requires the audited vLLM 0.19.0 API")
+    unaudited = _unaudited_runtime_allowed()
+    _require(
+        unaudited or __version__ == "0.19.0", "requires the audited vLLM 0.19.0 API"
+    )
     # File hashes from upstream v0.19.0; patched/nightly implementations decline.
     for implementation, digest in (
         (
@@ -151,6 +162,8 @@ def _contract():
             "2e45ac35100a1396bd03f9fe8d7f3e4dd41f3dc0a78b3bc7e5e118b536a0fe3c",
         ),
     ):
+        if unaudited:
+            break
         try:
             actual = hashlib.sha256(
                 Path(inspect.getfile(implementation)).read_bytes()
@@ -425,7 +438,7 @@ def prepare_partial_checkpoint(
         config = vllm_config.model_config
         parallel = vllm_config.parallel_config
         _require(
-            config.enforce_eager
+            (config.enforce_eager or _unaudited_runtime_allowed())
             and config.dtype in _DTYPES
             and parallel.pipeline_parallel_size == 1
             and not parallel.enable_expert_parallel

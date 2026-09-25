@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
     MX_REFIT_FULL_STREAMING: bool
+    MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME: bool
     MX_REFIT_STREAM_WINDOW_LAYERS: int
     MX_REFIT_TIMING: bool
     MX_S3_DOWNLOAD_RANGE_BYTES: int
@@ -142,6 +143,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_FULL_STREAMING": lambda: parse_bool(
         os.environ.get("MX_REFIT_FULL_STREAMING", "false"),
         "MX_REFIT_FULL_STREAMING",
+    ),
+    # Skip partial checkpoint vLLM version, source-hash and eager checks.
+    "MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME": lambda: parse_bool(
+        os.environ.get("MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME", "false"),
+        "MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME",
     ),
     # Decoder layers per streamed full-refit request; 0 streams all at once.
     "MX_REFIT_STREAM_WINDOW_LAYERS": lambda: require_non_negative_int(

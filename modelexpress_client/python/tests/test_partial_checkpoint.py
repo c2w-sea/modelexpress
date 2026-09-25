@@ -491,3 +491,107 @@ def test_explicit_mapping_does_not_bypass_capability_checks(invalid):
         model.tokens.quant_method = Unquantized()
     with pytest.raises((_Unsupported, AttributeError)):
         _capability_bindings(model, mapping)
+
+
+def _fake_vllm_contract_modules(monkeypatch, version):
+    import sys
+    from types import ModuleType
+
+    names = {
+        "vllm.model_executor.layers.attention": ("MLAAttention",),
+        "vllm.model_executor.layers.attention.attention": ("set_default_quant_scales",),
+        "vllm.model_executor.layers.linear": (
+            "ColumnParallelLinear",
+            "UnquantizedLinearMethod",
+        ),
+        "vllm.model_executor.layers.mla": ("MultiHeadLatentAttentionWrapper",),
+        "vllm.model_executor.layers.quantization.utils.quant_utils": (
+            "get_and_maybe_dequant_weights",
+        ),
+        "vllm.model_executor.layers.vocab_parallel_embedding": (
+            "UnquantizedEmbeddingMethod",
+            "VocabParallelEmbedding",
+        ),
+        "vllm.model_executor.models.deepseek_v2": ("DeepseekV2MLAAttention",),
+        "vllm.model_executor.models.kimi_k25": ("KimiK25ForConditionalGeneration",),
+    }
+    parents = {
+        ".".join(name.split(".")[:depth])
+        for name in names
+        for depth in range(1, name.count(".") + 1)
+    }
+    for name in sorted(parents | set(names) | {"vllm.version"}):
+        module = ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+    for name, attrs in names.items():
+        for attr in attrs:
+            members = {"weight_loader": None, "process_weights_after_loading": None}
+            setattr(sys.modules[name], attr, type(attr, (nn.Module,), members))
+    sys.modules["vllm.version"].__version__ = version
+    return sys.modules
+
+
+def test_contract_requires_audited_vllm_unless_unaudited_runtime_allowed(
+    monkeypatch,
+):
+    modules = _fake_vllm_contract_modules(monkeypatch, "0.28.1rc1.dev652")
+    monkeypatch.delenv("MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME", raising=False)
+    with pytest.raises(partial_checkpoint._Unsupported, match="0.19.0"):
+        partial_checkpoint._contract()
+
+    monkeypatch.setenv("MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME", "true")
+    contract = partial_checkpoint._contract()
+    assert contract[0] is modules[
+        "vllm.model_executor.layers.vocab_parallel_embedding"
+    ].VocabParallelEmbedding
+
+
+def test_unaudited_runtime_allows_graph_execution(monkeypatch, tmp_path):
+    monkeypatch.setattr(partial_checkpoint, "_contract", lambda: (nn.Module,) * 7)
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(enforce_eager=False, dtype=torch.bfloat16),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, enable_expert_parallel=False
+        ),
+        cache_config=SimpleNamespace(cpu_offload_gb=0, cache_dtype="auto"),
+    )
+    reads = []
+
+    def index(path):
+        reads.append(path)
+        return (), {}, ()
+
+    monkeypatch.setattr(partial_checkpoint, "index_checkpoint_tensors", index)
+    monkeypatch.setenv("MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME", "true")
+    assert (
+        partial_checkpoint.prepare_partial_checkpoint(
+            nn.Module(),
+            config,
+            PreparedCheckpoint("target", tmp_path, {}),
+            serving_version="base",
+            tensor_mapping={},
+        )
+        is None
+    )
+    assert reads == [tmp_path]
+
+
+def test_kimi_mapping_source_hash_is_waived_only_for_unaudited_runtime(monkeypatch):
+    from modelexpress_rl.inference.engines.vllm.checkpoint_bindings import (
+        default_checkpoint_mapping,
+    )
+
+    modules = _fake_vllm_contract_modules(monkeypatch, "0.28.1rc1.dev652")
+    kimi = modules["vllm.model_executor.models.kimi_k25"].KimiK25ForConditionalGeneration
+    monkeypatch.setattr(
+        "modelexpress_rl.inference.engines.vllm.checkpoint_bindings.inspect.getfile",
+        lambda _cls: __file__,
+    )
+    monkeypatch.delenv("MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME", raising=False)
+    with pytest.raises(partial_checkpoint._Unsupported, match="audited tag"):
+        default_checkpoint_mapping(kimi())
+
+    monkeypatch.setenv("MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME", "1")
+    embedding = "language_model.model.embed_tokens"
+    assert default_checkpoint_mapping(kimi()) == {f"{embedding}.weight": embedding}

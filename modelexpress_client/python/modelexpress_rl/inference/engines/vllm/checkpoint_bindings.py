@@ -7,7 +7,7 @@ import hashlib
 import inspect
 from pathlib import Path
 
-from .partial_checkpoint import _require
+from .partial_checkpoint import _require, _unaudited_runtime_allowed
 
 
 def default_checkpoint_mapping(model) -> dict[str, str]:
@@ -25,7 +25,8 @@ def default_checkpoint_mapping(model) -> dict[str, str]:
     except (OSError, TypeError):
         digest = None
     _require(
-        digest == "1bbce9c894945a6b95818181b52cd066debb39eb8f47334ecff6d870ead5326b",
+        digest == "1bbce9c894945a6b95818181b52cd066debb39eb8f47334ecff6d870ead5326b"
+        or _unaudited_runtime_allowed(),
         "automatic checkpoint mapping source differs from the audited tag",
     )
     embedding = "language_model.model.embed_tokens"

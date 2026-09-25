@@ -35,6 +35,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_S3_MAX_ATTEMPTS == 5
     assert envs.MX_S3_TCP_KEEPALIVE is True
     assert envs.MX_REFIT_STREAM_WINDOW_LAYERS == 2
+    assert envs.MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME is False
 
 
 def test_values_are_normalized_and_read_live(monkeypatch):
