@@ -406,3 +406,87 @@ def test_vllm_plugin_registers_weight_transfer_engine(monkeypatch):
             "ModelExpressWeightTransferEngine",
         )
     ]
+
+
+def test_weight_transfer_engine_defaults_to_full_checkpoint_install(monkeypatch):
+    monkeypatch.delenv("MX_REFIT_CHECKPOINT_INSTALL_MODE", raising=False)
+    initialize = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(
+        weight_transfer_engine.ModelExpressGeneratorClient, "initialize", initialize
+    )
+    new_group = MagicMock()
+    monkeypatch.setattr(torch.distributed, "new_group", new_group)
+    engine = ModelExpressWeightTransferEngine(
+        SimpleNamespace(),
+        SimpleNamespace(
+            parallel_config=SimpleNamespace(),
+            model_config=SimpleNamespace(model="test/model"),
+        ),
+        torch.device("cpu"),
+        torch.nn.Linear(2, 2),
+    )
+    engine.init_transfer_engine(engine.init_info_cls())
+
+    config = initialize.call_args.args[0]
+    assert config.checkpoint_install_mode == "full"
+    assert config.engine_context.checkpoint_collective is None
+    new_group.assert_not_called()
+
+
+def test_weight_transfer_engine_wires_partial_checkpoint_collective(monkeypatch):
+    from datetime import timedelta
+
+    monkeypatch.setenv("MX_REFIT_CHECKPOINT_INSTALL_MODE", "partial_if_supported")
+    initialize = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr(
+        weight_transfer_engine.ModelExpressGeneratorClient, "initialize", initialize
+    )
+    group = object()
+    new_group = MagicMock(return_value=group)
+    monkeypatch.setattr(torch.distributed, "new_group", new_group)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    gathers = []
+
+    def all_gather_object(output, value, group=None):
+        gathers.append(group)
+        output[:] = [value, value]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    model = torch.nn.Linear(2, 2)
+    engine = ModelExpressWeightTransferEngine(
+        SimpleNamespace(),
+        SimpleNamespace(
+            parallel_config=SimpleNamespace(),
+            model_config=SimpleNamespace(model="test/model"),
+        ),
+        torch.device("cpu"),
+        model,
+    )
+    engine.init_transfer_engine(
+        engine.init_info_cls(
+            initial_base_version_id="base",
+            refit_checkpoint_dir="/cache/modelexpress",
+            object_storage_type="S3",
+        )
+    )
+
+    config = initialize.call_args.args[0]
+    context = config.engine_context.checkpoint_collective
+    assert config.checkpoint_install_mode == "partial_if_supported"
+    assert config.engine_context.model is model
+    new_group.assert_called_once_with(
+        backend="gloo", timeout=timedelta(seconds=context.timeout_seconds)
+    )
+    assert context.world_size == 2
+    assert context.gather("state") == ("state", "state")
+    assert gathers == [group]
+    with context.safe_point():
+        pass
+    context.fence()
+
+
+def test_weight_transfer_engine_rejects_unknown_install_mode(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_CHECKPOINT_INSTALL_MODE", "partial")
+    engine, _ = _engine(monkeypatch, initialize=False)
+    with pytest.raises(ValueError, match="MX_REFIT_CHECKPOINT_INSTALL_MODE"):
+        engine.init_transfer_engine(engine.init_info_cls())

@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     MX_REFIT_METADATA_PORT: int
     MX_REFIT_FULL_STREAMING: bool
     MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME: bool
+    MX_REFIT_CHECKPOINT_INSTALL_MODE: str
     MX_REFIT_STREAM_WINDOW_LAYERS: int
     MX_REFIT_TIMING: bool
     MX_S3_DOWNLOAD_RANGE_BYTES: int
@@ -144,6 +145,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.environ.get("MX_REFIT_FULL_STREAMING", "false"),
         "MX_REFIT_FULL_STREAMING",
     ),
+    # full, or partial_if_supported for the PR 810 collective partial install.
+    "MX_REFIT_CHECKPOINT_INSTALL_MODE": lambda: _require_choice(
+        os.environ.get("MX_REFIT_CHECKPOINT_INSTALL_MODE", "full").strip(),
+        ("full", "partial_if_supported"),
+        "MX_REFIT_CHECKPOINT_INSTALL_MODE",
+    ),
     # Skip partial checkpoint vLLM version, source-hash and eager checks.
     "MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME": lambda: parse_bool(
         os.environ.get("MX_PARTIAL_CHECKPOINT_ALLOW_UNAUDITED_RUNTIME", "false"),
@@ -165,6 +172,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "RANK": lambda: os.environ.get("RANK"),
 }
+
+
+def _require_choice(value: str, choices: tuple[str, ...], name: str) -> str:
+    if value not in choices:
+        raise ValueError(f"{name} must be one of: {', '.join(choices)}")
+    return value
 
 
 def require_positive_int(value: int, name: str) -> int:

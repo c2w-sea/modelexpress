@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
+from datetime import timedelta
 from time import perf_counter
 from typing import Any
 
@@ -18,6 +20,8 @@ from vllm.distributed.weight_transfer.base import (
 )
 
 from modelexpress import envs
+from modelexpress_rl import envs as rl_envs
+from modelexpress_rl.inference.checkpoint_lifecycle import CheckpointCollectiveContext
 from modelexpress_rl.inference.client import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
@@ -33,6 +37,39 @@ from modelexpress_rl.version import WeightVersionRef
 from .context import VllmGeneratorContext
 
 logger = logging.getLogger(__name__)
+
+# Ranks reach apply after uneven staging (co-located ranks wait for one
+# reconstruction), so the deadline covers staging skew, not only a lost rank.
+_CHECKPOINT_COLLECTIVE_TIMEOUT_SECONDS = 900.0
+
+
+def _checkpoint_collective() -> CheckpointCollectiveContext:
+    """Collective controls for partial checkpoint installs on this vLLM worker.
+
+    The HotLoad controller pauses the engine before every update and leaves a
+    failed engine paused, so safe_point adds no scheduler control of its own.
+    """
+    import torch.distributed as dist
+
+    timeout = _CHECKPOINT_COLLECTIVE_TIMEOUT_SECONDS
+    group = dist.new_group(backend="gloo", timeout=timedelta(seconds=timeout))
+    world_size = dist.get_world_size()
+
+    def all_gather(value: object, _timeout: float) -> tuple[object, ...]:
+        values: list[object] = [None] * world_size
+        dist.all_gather_object(values, value, group=group)
+        return tuple(values)
+
+    def fence() -> None:
+        logger.error("ModelExpress checkpoint transaction fenced this worker")
+
+    return CheckpointCollectiveContext(
+        world_size=world_size,
+        all_gather=all_gather,
+        safe_point=nullcontext,
+        fence=fence,
+        timeout_seconds=timeout,
+    )
 
 
 @dataclass
@@ -151,6 +188,13 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 region_name=init_info.object_storage_region_name,
             )
 
+        install_mode = rl_envs.MX_REFIT_CHECKPOINT_INSTALL_MODE
+        engine_context = self._engine_context
+        if install_mode == "partial_if_supported":
+            engine_context = replace(
+                engine_context, checkpoint_collective=_checkpoint_collective()
+            )
+
         model_name = (
             init_info.model_name
             if init_info.model_name is not None
@@ -158,7 +202,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
         )
         self._client = ModelExpressGeneratorClient.initialize(
             ModelExpressGeneratorConfig(
-                engine_context=self._engine_context,
+                engine_context=engine_context,
                 model_name=model_name,
                 server_url=init_info.server_url,
                 registration_ttl_seconds=init_info.registration_ttl_seconds,
@@ -168,6 +212,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 rpc_timeout_seconds=init_info.rpc_timeout_seconds,
                 object_storage=object_storage,
                 initial_serving_version_id=init_info.initial_serving_version_id,
+                checkpoint_install_mode=install_mode,
             )
         )
         logger.info("ModelExpress weight transfer initialized model=%s", model_name)
