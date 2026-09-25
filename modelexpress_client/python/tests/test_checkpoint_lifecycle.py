@@ -62,7 +62,7 @@ def test_config_rejects_missing_lifecycle_and_unknown_mode():
         )
 
 
-def test_config_requires_canonical_only_source_order(tmp_path):
+def test_config_requires_object_storage_in_source_order(tmp_path):
     kwargs = {
         "engine_context": VllmGeneratorContext(
             model=None, vllm_config=None, checkpoint_collective=_context()
@@ -75,12 +75,18 @@ def test_config_requires_canonical_only_source_order(tmp_path):
             refit_checkpoint_dir=str(tmp_path),
         ),
     }
-    with pytest.raises(ValueError, match="source_order"):
-        ModelExpressGeneratorConfig(**kwargs)
-    config = ModelExpressGeneratorConfig(
-        **kwargs, source_order=(WeightSource.OBJECT_STORAGE,)
-    )
-    assert config.checkpoint_install_mode == "partial_if_supported"
+    with pytest.raises(ValueError, match="object_storage"):
+        ModelExpressGeneratorConfig(
+            **(kwargs | {"object_storage": None}),
+            source_order=(WeightSource.GENERATOR,),
+        )
+    for order in (
+        None,
+        (WeightSource.OBJECT_STORAGE,),
+        (WeightSource.GENERATOR, WeightSource.OBJECT_STORAGE),
+    ):
+        config = ModelExpressGeneratorConfig(**kwargs, source_order=order)
+        assert config.checkpoint_install_mode == "partial_if_supported"
 
 
 def _run_clients(tmp_path, *, failure=None, unsupported=False, noop=None, repeat=False):
@@ -371,3 +377,102 @@ def test_repeated_apply_does_not_reinstall(tmp_path):
     assert results == ["partial", "partial"]
     assert sum(name == "copy" for name, _ in events) == 2
     assert not any(s["fenced"] for s in states)
+
+
+def _run_routes(tmp_path, routes):
+    """Apply one update per rank; routes are "checkpoint" or "p2p"."""
+    condition = Condition()
+    rounds = {}
+    sequences = [0] * len(routes)
+    events = []
+
+    def gather(rank, value, timeout):
+        with condition:
+            seq = sequences[rank]
+            sequences[rank] += 1
+            current = rounds.setdefault(seq, {})
+            current[rank] = value
+            condition.notify_all()
+            if not condition.wait_for(
+                lambda: len(current) == len(routes), timeout=timeout
+            ):
+                raise TimeoutError("rank lost")
+            return tuple(current[i] for i in range(len(routes)))
+
+    class Method:
+        @contextmanager
+        def installation_context(self, prepared):
+            yield
+
+    class Installer:
+        def install(self, prepared):
+            events.append(("install", prepared))
+            return {"perf/mx_receive_install_time": 1.0}
+
+    def run(rank):
+        client = ModelExpressGeneratorClient()
+        client._serving_version_id = "base"
+        client._checkpoint_collective = _context(
+            world_size=len(routes),
+            all_gather=lambda value, timeout: gather(rank, value, timeout),
+            fence=lambda: events.append(("fence", rank)),
+            timeout_seconds=2,
+        )
+        if routes[rank] == "checkpoint":
+            method = CanonicalDeltaUpdateMethod.__new__(CanonicalDeltaUpdateMethod)
+            prepared = PreparedCheckpointArtifact(
+                PreparedCheckpoint("target", tmp_path, {})
+            )
+        else:
+            method = Method()
+            prepared = SimpleNamespace(metrics={})
+        update = SessionUpdate(
+            plan=SimpleNamespace(
+                method=method,
+                installer=Installer(),
+                source=SimpleNamespace(kind=WeightSource.GENERATOR),
+                version=SimpleNamespace(version_id="target"),
+            ),
+            prepared=prepared,
+            lease=SimpleNamespace(close=lambda: None),
+        )
+        client._runtime = SimpleNamespace(
+            session=WeightUpdateSession(planner=None, start_lease=None),
+            unpublish_runtime_tensors=lambda: events.append(("unpublish", rank)),
+            publish_runtime_tensors=lambda v: events.append(("publish", rank)),
+        )
+        handle = StagedWeightHandle(client=client, version_id="target", update=update)
+        client._active_handle = handle
+        try:
+            return client.apply_weight(handle), client
+        except BaseException as error:  # noqa: BLE001 - inspect every rank
+            return error, client
+
+    with ThreadPoolExecutor(max_workers=len(routes)) as executor:
+        results = list(executor.map(run, range(len(routes))))
+    return results, events
+
+
+def test_partial_mode_installs_p2p_updates_without_the_checkpoint_lifecycle(tmp_path):
+    results, events = _run_routes(tmp_path, ["p2p", "p2p"])
+    assert [result for result, _ in results] == [
+        {"perf/mx_receive_install_time": 1.0}
+    ] * 2
+    assert all(client._serving_version_id == "target" for _, client in results)
+    assert not any(name == "fence" for name, _ in events)
+    assert sorted(name for name, _ in events if name != "install") == [
+        "publish", "publish", "unpublish", "unpublish",
+    ]
+
+
+def test_partial_mode_fences_when_ranks_choose_different_routes(tmp_path):
+    from modelexpress_rl.inference.checkpoint_transaction import (
+        CheckpointTransactionError,
+    )
+
+    results, events = _run_routes(tmp_path, ["checkpoint", "p2p"])
+    assert all(
+        isinstance(result, CheckpointTransactionError) for result, _ in results
+    )
+    assert sorted(rank for name, rank in events if name == "fence") == [0, 1]
+    assert not any(name == "install" for name, _ in events)

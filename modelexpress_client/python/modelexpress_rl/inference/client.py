@@ -105,12 +105,15 @@ class ModelExpressGeneratorConfig:
                     "CheckpointCollectiveContext providing serving pause, fence, "
                     "and finite-timeout full-worker transport"
                 )
-            if self.object_storage is None or self.source_order != (
-                WeightSource.OBJECT_STORAGE,
+            # Generator P2P may precede object storage; only canonical
+            # checkpoint updates take the collective path.
+            if self.object_storage is None or (
+                self.source_order is not None
+                and WeightSource.OBJECT_STORAGE not in self.source_order
             ):
                 raise ValueError(
-                    "partial_if_supported requires object_storage and explicit "
-                    "source_order=(WeightSource.OBJECT_STORAGE,) on every rank"
+                    "partial_if_supported requires object_storage and "
+                    "WeightSource.OBJECT_STORAGE in source_order on every rank"
                 )
         if self.registration_ttl_seconds is not None:
             rl_envs.require_positive_int(
@@ -156,6 +159,14 @@ class ModelExpressGeneratorConfig:
                     "object_storage source_order may contain only "
                     "WeightSource.GENERATOR and WeightSource.OBJECT_STORAGE"
                 )
+
+
+def _is_canonical_checkpoint(update: Any) -> bool:
+    from .methods.canonical_delta import CanonicalDeltaUpdateMethod
+
+    return isinstance(update.prepared, PreparedCheckpointArtifact) and isinstance(
+        update.plan.method, CanonicalDeltaUpdateMethod
+    )
 
 
 class StagedWeightHandle:
@@ -401,7 +412,9 @@ class ModelExpressGeneratorClient:
             if staged._update.released:
                 raise RuntimeError("staged weight has already been released")
             runtime = self._require_runtime()
-            if self._checkpoint_collective is not None:
+            if self._checkpoint_collective is not None and _is_canonical_checkpoint(
+                staged._update
+            ):
                 return self._apply_checkpoint_collectively(staged, runtime)
             was_applied = staged._update.applied
             serving_version_id = self._serving_version_id
@@ -449,6 +462,7 @@ class ModelExpressGeneratorClient:
             staged.version_id,
             staged._update is not None,
             staged.applied,
+            staged._update is not None and _is_canonical_checkpoint(staged._update),
         )
         try:
             peers = context.gather(state)
