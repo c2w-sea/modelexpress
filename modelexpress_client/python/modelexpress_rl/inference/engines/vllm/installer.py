@@ -414,7 +414,11 @@ class _VllmInstaller(EngineInstaller):
                     serving_version=serving_version,
                     tensor_mapping=self._checkpoint_tensor_mapping,
                 ),
-                install_full=lambda: self.install_checkpoint(prepared.path),
+                install_full=lambda: (
+                    self.install_streamed_checkpoint(prepared.streaming)
+                    if prepared.streaming is not None
+                    else self.install_checkpoint(prepared.path)
+                ),
                 synchronize=lambda: torch.cuda.synchronize(self._device),
                 activate=activate,
                 commit_version=commit_version,

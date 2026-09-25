@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -694,6 +694,39 @@ def test_collective_checkpoint_api_commits_or_permanently_fences(
     else:
         assert apply() == "full"
         assert events == ["enter", "full", "sync", "exit", "activate", "commit"]
+
+
+def test_collective_full_reload_installs_streamed_checkpoint(monkeypatch, tmp_path):
+    from unittest.mock import Mock
+
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    installer = _VllmInstaller(
+        model=nn.Module(), vllm_config=object(), model_config=object(),
+        device=torch.device("cpu"),
+    )
+    events = []
+    stream = Mock()
+    checkpoint = PreparedCheckpoint("target", tmp_path, {}, streaming=stream)
+    monkeypatch.setattr(
+        installer, "install_checkpoint", lambda _path: events.append("disk")
+    )
+    monkeypatch.setattr(
+        installer,
+        "install_streamed_checkpoint",
+        lambda value: events.append(("stream", value)),
+    )
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda _device: None)
+
+    assert (
+        installer.install_checkpoint_collectively(
+            checkpoint, serving_version="base", world_size=1,
+            all_gather=lambda value: (value,), installation_context=nullcontext,
+            activate=lambda: None, commit_version=lambda: None,
+            fence=lambda: events.append("fence"),
+        )
+        == "full"
+    )
+    assert events == [("stream", stream)]
 
 
 def test_collective_checkpoint_rejects_different_rank_mappings(monkeypatch, tmp_path):
