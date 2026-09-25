@@ -86,8 +86,8 @@ class PreparedCheckpoint:
     target_version: str
     path: Path
     metrics: dict[str, float]
-    streaming: StreamedCheckpoint | None = None
     changes: CheckpointChanges | None = None
+    streaming: StreamedCheckpoint | None = None
 
 
 @dataclass(frozen=True)
