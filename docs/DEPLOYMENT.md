@@ -1565,6 +1565,9 @@ with `IncompleteRefit` if a pair is still pending afterwards, because the fused
 indexer parameter was then not written.
 Streaming weight iterators may yield views into reused read buffers, so the vLLM
 adapter copies FP8 indexer `wk` tensors before vLLM buffers them for pairing.
+After the stream it re-feeds every recorded FP8 indexer `wk` weight together with
+its scale, so each fused indexer parameter is written even if a pair was stranded
+during streaming; a streamed weight without its scale fails the load.
 With deferred materialization, each rank holds a shared installation lock from
 staging until activation or release; the background writer takes the exclusive
 lock, so it starts only after every co-located rank has finished reading the
