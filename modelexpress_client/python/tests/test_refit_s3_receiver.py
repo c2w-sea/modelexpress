@@ -1495,6 +1495,7 @@ def test_canonical_s3_reinstalls_active_checkpoint_after_install_failure(
 def test_canonical_s3_replays_aliased_manifest_ids_using_mx_cache_ids(
     monkeypatch, tmp_path, omit_version_metadata
 ):
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
     tensors = [torch.tensor([float(i), float(i + 1)]) for i in (1, 3, 5)]
     objects = {}
     for index in (1, 2):
@@ -1514,19 +1515,31 @@ def test_canonical_s3_replays_aliased_manifest_ids_using_mx_cache_ids(
             del manifest["metadata"]["base_version"]
             objects[uri] = json.dumps(manifest).encode()
     adapter, storage = _build(monkeypatch, tmp_path, objects)
+    follower = _colocated(tmp_path)
     first = _inputs(None)
     second = _inputs(
         None, version="target-b", base_version="target-a", version_label=2
     )
+    expected = (
+        receiver_module.DeltaChange("base-a", "target-a", frozenset({"weight"})),
+        receiver_module.DeltaChange("target-a", "target-b", frozenset({"weight"})),
+    )
     staged = adapter.stage_weight(first)
+    assert staged.delta_changes == expected[:1]
     adapter.apply_weight(staged)
     adapter.release_staged_weight(staged)
     storage.calls.clear()
 
     cached = adapter.stage_weight(first)
     assert storage.calls == []
+    assert cached.delta_changes == expected[:1]
     adapter.release_staged_weight(cached)
     staged = adapter.stage_chain((first, second))
+    assert staged.delta_changes == expected
+    reused = follower.stage_chain((first, second))
+    assert reused.delta_changes == expected
+    follower.release_staged_weight(reused)
+    follower.close()
 
     assert torch.equal(load_file(staged.path / "model.safetensors")["weight"], tensors[2])
     store = adapter._checkpoint.store
@@ -3472,6 +3485,22 @@ def test_malformed_delta_lineage_falls_back(monkeypatch, tmp_path, index):
     (store.delta_path("target-a") / "model.safetensors.index.json").write_text(
         json.dumps(index)
     )
+    assert adapter._checkpoint._delta_changes("target-b") == ()
+    adapter.release_staged_weight(staged)
+    adapter.close()
+
+
+def test_modified_delta_tensor_names_drop_lineage(monkeypatch, tmp_path):
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
+    adapter, _ = _build(monkeypatch, tmp_path, _two_delta_objects())
+    staged = adapter.stage_chain(_two_delta_chain())
+    index_path = (
+        adapter._checkpoint.store.delta_path("target-a")
+        / "model.safetensors.index.json"
+    )
+    index = json.loads(index_path.read_text())
+    index["weight_map"] = {}
+    index_path.write_text(json.dumps(index))
     assert adapter._checkpoint._delta_changes("target-b") == ()
     adapter.release_staged_weight(staged)
     adapter.close()
