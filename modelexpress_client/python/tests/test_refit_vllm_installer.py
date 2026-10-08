@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 import sys
 from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
@@ -2506,3 +2507,43 @@ def test_load_time_alias_restoration_does_not_ignore_missing_ties(recorded):
     del model.tied
     with pytest.raises(AttributeError):
         installer._restore_parameter_aliases(aliases)
+
+
+def test_reload_clears_stale_fp8_indexer_entries_before_loading(monkeypatch, caplog):
+    model = nn.Module()
+    model._pending_indexer_wk_fp8 = {
+        "model.layers.0.self_attn.indexer": {"weight": torch.zeros(2)}
+    }
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+    seen = []
+
+    with caplog.at_level(logging.WARNING):
+        installer._reload(lambda _aliases: seen.append(dict(model._pending_indexer_wk_fp8)))
+
+    assert seen == [{}]
+    assert "model.layers.0.self_attn.indexer" in caplog.text
+
+
+def test_reload_fails_when_an_fp8_indexer_pair_is_left_pending(monkeypatch):
+    model = nn.Module()
+    _install_fake_vllm(monkeypatch, lambda _model: None)
+    installer = _VllmInstaller(
+        model=model,
+        vllm_config=object(),
+        model_config=object(),
+        device=torch.device("cpu"),
+    )
+
+    def load(_aliases):
+        model._pending_indexer_wk_fp8 = {
+            "model.layers.1.self_attn.indexer": {"scale": torch.ones(1)}
+        }
+
+    with pytest.raises(IncompleteRefit, match="model.layers.1.self_attn.indexer"):
+        installer._reload(load)

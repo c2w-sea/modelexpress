@@ -1296,7 +1296,9 @@ class _VllmInstaller(EngineInstaller):
             initialize_layerwise_reload(self._model)
             self._restore_parameter_aliases(load_aliases)
             _reserve_runtime_buffer_slots(self._model, LAYERWISE_INFO)
+            _clear_pending_fp8_indexer_wk(self._model)
             load(load_aliases)
+            _require_no_pending_fp8_indexer_wk(self._model)
             finalize_layerwise_reload(self._model, self._model_config)
             self._validate_alias_owners(aliases)
 
@@ -1335,6 +1337,42 @@ class _VllmInstaller(EngineInstaller):
                 "vLLM refit left parameters on the meta device; "
                 f"count={len(meta_parameters)}, names={meta_parameters[:10]}"
             )
+
+
+# vLLM DeepSeek-V3.2/GLM buffers FP8 indexer wk and its scale here until both
+# arrive; the buffer outlives load_weights, so a stale entry pairs wrongly.
+_PENDING_FP8_INDEXER_WK = "_pending_indexer_wk_fp8"
+
+
+def _describe_pending(pending: dict) -> list[str]:
+    return [
+        f"{prefix}: "
+        + ", ".join(
+            f"{part}={getattr(t, 'dtype', None)}{tuple(getattr(t, 'shape', ()))}"
+            for part, t in sorted(entry.items())
+        )
+        for prefix, entry in sorted(pending.items())
+    ]
+
+
+def _clear_pending_fp8_indexer_wk(model: torch.nn.Module) -> None:
+    pending = getattr(model, _PENDING_FP8_INDEXER_WK, None)
+    if pending:
+        logger.warning(
+            "Discarding %d stale FP8 indexer wk entries before reload: %s",
+            len(pending),
+            _describe_pending(pending),
+        )
+        pending.clear()
+
+
+def _require_no_pending_fp8_indexer_wk(model: torch.nn.Module) -> None:
+    pending = getattr(model, _PENDING_FP8_INDEXER_WK, None)
+    if pending:
+        raise IncompleteRefit(
+            "FP8 indexer wk weight/scale pairs left pending after reload: "
+            f"{_describe_pending(pending)}"
+        )
 
 
 __all__: list[str] = []
