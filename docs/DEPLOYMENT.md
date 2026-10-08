@@ -1548,3 +1548,8 @@ Surgical delta installation uses canonical MX version IDs from the validated
 local checkpoint chain. Trainer manifest version labels may be aliases or
 omitted. Cached delta artifacts are verified before their tensor names are used;
 missing or modified artifacts disable surgical lineage and use full installation.
+Incomplete-layer checks are limited to the active model. When all primary
+checkpoint tensors have been selected and there are no secondary weight sources,
+partial element counts are finalized by vLLM without rescanning the checkpoint.
+Partial selections and models with secondary sources retain conservative fallback.
+Diagnostics identify module names, types, and loaded/expected element counts.
