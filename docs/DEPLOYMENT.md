@@ -1543,3 +1543,8 @@ Wire-to-engine dtype conversion respects the captured destination slice, strides
 and arena storage offset, including padding surrounding the destination view.
 Bounded staging views are zeroed before each READ so untouched loader padding
 cannot retain bytes from a previous batch or version.
+
+Surgical delta installation uses canonical MX version IDs from the validated
+local checkpoint chain. Trainer manifest version labels may be aliases or
+omitted. Cached delta artifacts are verified before their tensor names are used;
+missing or modified artifacts disable surgical lineage and use full installation.
