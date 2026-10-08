@@ -29,6 +29,7 @@ from pathlib import Path
 from types import GetSetDescriptorType
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 from modelexpress import envs
 from modelexpress.accelerators import accelerator_backend_for
@@ -1606,10 +1607,10 @@ class _DeferredOverlay:
                 expected_checksum=checksum,
             )
         else:
-            data = bytearray(parent)
+            data = np.array(np.frombuffer(parent, dtype=np.uint8))
         info = self._metadata[name]
         return (
-            torch.frombuffer(data, dtype=torch.uint8)
+            torch.from_numpy(data)
             .view(SAFETENSORS_DTYPE_MAP[info["dtype"]])
             .reshape(info["shape"])
         )
