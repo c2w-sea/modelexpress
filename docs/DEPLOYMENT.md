@@ -1553,3 +1553,7 @@ checkpoint tensors have been selected and there are no secondary weight sources,
 partial element counts are finalized by vLLM without rescanning the checkpoint.
 Partial selections and models with secondary sources retain conservative fallback.
 Diagnostics identify module names, types, and loaded/expected element counts.
+vLLM buffers FP8 indexer `wk` weights and scales across `load_weights` calls until
+both arrive. Every refit reload discards stale buffered entries first and fails
+with `IncompleteRefit` if a pair is still pending afterwards, because the fused
+indexer parameter was then not written.
