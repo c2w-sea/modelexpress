@@ -1158,9 +1158,9 @@ class _VllmInstaller(EngineInstaller):
         """Reload only the modules whose checkpoint tensors a delta changed.
 
         Untouched layers receive no weights, so vLLM's finalize places their
-        existing kernel tensors back. If a fed module is still incomplete, the
-        rest of the checkpoint is streamed through the same reload, which is
-        then exactly a full reload.
+        existing kernel tensors back. If a fed module is still incomplete and
+        checkpoint weights remain, stream them through the same reload. Partial
+        counts after complete coverage are left to vLLM finalization.
         """
         from safetensors import safe_open
         from vllm.model_executor.layers.attention import is_deferred_attention_layer
@@ -1190,20 +1190,32 @@ class _VllmInstaller(EngineInstaller):
             nonlocal fallback
             self._model.load_weights(subset())
             incomplete = [
-                type(layer).__name__
-                for layer, info in LAYERWISE_INFO.items()
-                if info.can_load()
+                (name, type(layer).__name__, info.load_numel, info.load_numel_total)
+                for name, layer in self._model.named_modules()
+                if (info := LAYERWISE_INFO.get(layer)) is not None
+                and info.can_load()
                 and 0 < info.load_numel < info.load_numel_total
                 and not is_deferred_attention_layer(layer)
             ]
             if not incomplete:
                 return
+            if names == locations.keys() and not getattr(
+                self._model, "secondary_weights", ()
+            ):
+                logger.info(
+                    "Finalizing %d partial-count modules after complete checkpoint "
+                    "coverage (name, type, loaded, total): %s",
+                    len(incomplete),
+                    incomplete[:5],
+                )
+                return
             fallback = True
             logger.warning(
-                "Surgical checkpoint install left %d modules incomplete (%s); "
+                "Surgical checkpoint install left %d modules incomplete "
+                "(name, type, loaded, total: %s); "
                 "loading the rest of the checkpoint",
                 len(incomplete),
-                sorted(set(incomplete))[:5],
+                incomplete[:5],
             )
             load_config = copy.copy(self._vllm_config.load_config)
             object.__setattr__(load_config, "load_format", "safetensors")
