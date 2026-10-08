@@ -148,14 +148,15 @@ def reconstruct_delta_tensor(
     compression_format: str,
     checksum_format: str,
     expected_checksum: str,
-) -> bytearray:
-    """XOR one compressed delta onto a private copy of its parent tensor bytes.
+) -> np.ndarray:
+    """XOR one compressed delta onto its parent tensor bytes into a new buffer.
 
-    The parent is only read. The result is verified like an in-place apply.
+    The parent is only read; one ufunc pass per block copies and XORs it
+    without holding the GIL. The result is verified like an in-place apply.
     """
-    size = len(parent)
-    target = bytearray(parent)
-    view = np.frombuffer(target, dtype=np.uint8)
+    source = np.frombuffer(parent, dtype=np.uint8)
+    size = source.size
+    target = np.empty(size, dtype=np.uint8)
     checksum = checksum_factory(checksum_format)
     reader = _DECOMPRESSORS[compression_format](compressed)
     position = 0
@@ -165,10 +166,11 @@ def reconstruct_delta_tensor(
             if not block:
                 break
             delta = np.frombuffer(block, dtype=np.uint8)
-            region = view[position : position + delta.size]
-            np.bitwise_xor(region, delta, out=region)
+            end = position + delta.size
+            region = target[position:end]
+            np.bitwise_xor(source[position:end], delta, out=region)
             checksum.update(region)
-            position += delta.size
+            position = end
         extra = reader.read(1) if position == size else b""
     finally:
         reader.close()
