@@ -753,6 +753,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 | `MX_REFIT_STREAM_WINDOW_LAYERS` | `2` | Decoder layers per ranged ModelStreamer request during streamed full refit. Bounds GPU memory held by partially loaded layers; `0` streams the whole checkpoint in one request. |
 
 | `MX_REFIT_DELTA_SURGICAL` | `false` | Experimental vLLM delta install: reload only the modules whose checkpoint tensors the delta chain changed since the engine's last checkpoint install, instead of the whole prepared checkpoint. Falls back to a full reload when the lineage or live version is unknown, or when a fed module is incomplete. See the S3 delta refit guide. |
+| `MX_REFIT_DELTA_DEFERRED_MATERIALIZE` | `false` | Experimental, requires `MX_REFIT_DELTA_SURGICAL`. A single delta whose base is the cache head is staged without writing a checkpoint: installers reconstruct its tensors in memory from the parent checkpoint, and the target checkpoint is written in the background after every local installer activates. The next preparation waits for that write. |
 | `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL listen port for an RL generator's refit client; effective port is `MX_REFIT_METADATA_PORT + device_id`, separate from a boot-time loader manager |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
@@ -1564,3 +1565,8 @@ with `IncompleteRefit` if a pair is still pending afterwards, because the fused
 indexer parameter was then not written.
 Streaming weight iterators may yield views into reused read buffers, so the vLLM
 adapter copies FP8 indexer `wk` tensors before vLLM buffers them for pairing.
+With deferred materialization, each rank holds a shared installation lock from
+staging until activation or release; the background writer takes the exclusive
+lock, so it starts only after every co-located rank has finished reading the
+parent. An activated target that is not yet written is written by the next
+preparation before it continues; an unactivated one is discarded.

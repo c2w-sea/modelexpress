@@ -392,3 +392,81 @@ def test_reload_fails_when_an_fp8_indexer_pair_is_left_pending(fake_vllm, tmp_pa
 
     with pytest.raises(IncompleteRefit, match="model.layers.1.self_attn.indexer"):
         installer.install(_prepared(path, "v2", V2))
+
+
+def _deferred_delta(tmp_path, base_tensors, target_tensors):
+    import safetensors.numpy
+
+    from modelexpress_rl.inference.receiver import DeferredDelta
+    from modelexpress_rl.utils import checksum_factory, compress_delta, compute_delta
+
+    artifact = tmp_path / "delta"
+    artifact.mkdir()
+    payloads, checksums = {}, {}
+    for name, target in target_tensors.items():
+        raw_target = target.contiguous().view(torch.uint8).numpy()
+        raw_base = base_tensors[name].contiguous().view(torch.uint8).numpy()
+        delta, _ = compute_delta(raw_target, raw_base)
+        payloads[name] = compress_delta(delta)
+        checksum = checksum_factory("adler32")
+        checksum.update(raw_target)
+        checksums[name] = checksum.hexdigest()
+    (artifact / "delta.safetensors").write_bytes(
+        safetensors.numpy.save(payloads, metadata=checksums)
+    )
+    return DeferredDelta(
+        artifact=artifact,
+        index_metadata={"compression_format": "zstd", "checksum_format": "adler32"},
+        weight_map={name: "delta.safetensors" for name in target_tensors},
+    )
+
+
+def test_deferred_surgical_install_feeds_reconstructed_tensors_without_writing(
+    fake_vllm, tmp_path
+):
+    path = _checkpoint(tmp_path)
+    before = (path / "model.safetensors").read_bytes()
+    target = {"mlp.up_proj.weight": torch.tensor([40.0])}
+    deferred = _deferred_delta(tmp_path, TENSORS, target)
+    model = _Model()
+    fed = {}
+    original = model.load_weights
+
+    def load_weights(weights):
+        weights = list(weights)
+        fed.update({name: tensor.clone() for name, tensor in weights})
+        return original(iter(weights))
+
+    model.load_weights = load_weights
+    installer = _installer(model)
+    installer.install(_prepared(path, "v1"))
+    prepared = PreparedCheckpointArtifact(
+        PreparedCheckpoint("v2", path, {}, delta_changes=V2, deferred=deferred)
+    )
+
+    installer.install(prepared)
+
+    assert torch.equal(fed["mlp.up_proj.weight"], torch.tensor([40.0]))
+    assert torch.equal(fed["mlp.gate_proj.weight"], TENSORS["mlp.gate_proj.weight"])
+    assert (path / "model.safetensors").read_bytes() == before
+
+
+def test_deferred_install_without_lineage_reloads_every_tensor_from_memory(
+    fake_vllm, tmp_path
+):
+    path = _checkpoint(tmp_path)
+    before = (path / "model.safetensors").read_bytes()
+    deferred = _deferred_delta(
+        tmp_path, TENSORS, {"mlp.up_proj.weight": torch.tensor([40.0])}
+    )
+    model = _Model()
+    installer = _installer(model)
+    prepared = PreparedCheckpointArtifact(
+        PreparedCheckpoint("v2", path, {}, delta_changes=V2, deferred=deferred)
+    )
+
+    installer.install(prepared)
+
+    assert model.loads == [sorted(TENSORS)]
+    assert fake_vllm.full == []
+    assert (path / "model.safetensors").read_bytes() == before

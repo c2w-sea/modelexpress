@@ -236,6 +236,8 @@ class CanonicalDeltaUpdateMethod(UpdateMethod):
         if prepared is not self._active:
             raise RuntimeError("canonical checkpoint is no longer active")
         self._active = None
+        if prepared.checkpoint.streaming is None:
+            self._checkpoint.release(prepared.checkpoint)
 
     def close(self) -> None:
         self._active = None

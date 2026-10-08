@@ -17,6 +17,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import IO
 from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,7 @@ class LocalCheckpointStore:
         #     materialized/<version>/   derived, installable full checkpoints
         #     state.json                current preparation transaction
         #     active.json               version committed after engine install
+        #     deferred.json             delta installed from memory, not yet written
         #     .lock                     cross-process cache coordination
         #     .prepare.lock             serializes preparation requests
         #     .install.lock             excludes mutation during engine install
@@ -172,6 +174,7 @@ class LocalCheckpointStore:
         self.materialized_cache = self.cache / "materialized"
         self.state_path = self.cache / "state.json"
         self.active_path = self.cache / "active.json"
+        self.deferred_path = self.cache / "deferred.json"
         self.lock_path = self.cache / ".lock"
         self.prepare_lock_path = self.cache / ".prepare.lock"
         self.install_lock_path = self.cache / ".install.lock"
@@ -215,6 +218,21 @@ class LocalCheckpointStore:
 
     def preparation_locked(self):
         return self._locked(self.prepare_lock_path, shared=False)
+
+    def hold_installation(self) -> IO[str]:
+        """Take a shared installation lock that lasts until the handle closes."""
+        handle = self.install_lock_path.open("a+")
+        fcntl.flock(handle, fcntl.LOCK_SH)
+        return handle
+
+    def deferred(self) -> dict | None:
+        return self._read_json(self.deferred_path)
+
+    def write_deferred(self, value: dict[str, object]) -> None:
+        self._write_json(self.deferred_path, value)
+
+    def clear_deferred(self) -> None:
+        self.deferred_path.unlink(missing_ok=True)
 
     @contextmanager
     def replace_directory(

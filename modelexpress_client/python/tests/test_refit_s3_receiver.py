@@ -3596,3 +3596,240 @@ def test_modified_delta_tensor_names_drop_lineage(monkeypatch, tmp_path):
     assert adapter._checkpoint._delta_changes("target-b") == ()
     adapter.release_staged_weight(staged)
     adapter.close()
+
+
+def test_reconstruct_delta_tensor_matches_dense_apply_without_writing_parent():
+    from modelexpress_rl.inference.receiver import reconstruct_delta_tensor
+
+    base = torch.arange(4096, dtype=torch.float32).view(torch.uint8).numpy()
+    target = base.copy()
+    target[::97] ^= 1
+    delta, _ = compute_delta(target, base)
+    parent = base.tobytes()
+
+    result = reconstruct_delta_tensor(
+        memoryview(parent),
+        compress_delta(delta),
+        compression_format="zstd",
+        checksum_format="adler32",
+        expected_checksum=_checksum(target),
+    )
+
+    assert bytes(result) == target.tobytes()
+    assert parent == base.tobytes()
+    with pytest.raises(ValueError, match="checksum"):
+        reconstruct_delta_tensor(
+            memoryview(parent),
+            compress_delta(delta),
+            compression_format="zstd",
+            checksum_format="adler32",
+            expected_checksum=_checksum(base),
+        )
+    with pytest.raises(ValueError, match="size"):
+        reconstruct_delta_tensor(
+            memoryview(parent[:-4]),
+            compress_delta(delta),
+            compression_format="zstd",
+            checksum_format="adler32",
+            expected_checksum=_checksum(target),
+        )
+
+
+def _deferred_env(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DELTA_SURGICAL", "true")
+    monkeypatch.setenv("MX_REFIT_DELTA_DEFERRED_MATERIALIZE", "true")
+
+
+def test_deferred_delta_stages_from_the_parent_and_persists_after_activation(
+    monkeypatch, tmp_path
+):
+    _deferred_env(monkeypatch)
+    base = torch.tensor([1.0, 2.0])
+    middle = torch.tensor([3.0, 4.0])
+    target = torch.tensor([5.0, 6.0])
+    objects = _artifact(base.view(torch.uint8).numpy(), middle.view(torch.uint8).numpy())
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    store = adapter._checkpoint.store
+    parent = store.full_path("base-a") / "model.safetensors"
+    before = parent.read_bytes()
+
+    first = adapter.stage_weight(_inputs(None))
+
+    assert first.deferred is not None
+    assert first.path == store.full_path("base-a")
+    assert not store.materialized_path("target-a").exists()
+    assert store.state().version == "base-a"
+    assert parent.read_bytes() == before
+    adapter.apply_weight(first)
+    adapter.release_staged_weight(first)
+    adapter._checkpoint.wait_deferred_persistence()
+
+    assert torch.equal(
+        load_file(store.materialized_path("target-a") / "model.safetensors")["weight"],
+        middle,
+    )
+    assert store.state().version == "target-a"
+    assert store.active_version() == "target-a"
+    assert store.deferred() is None
+    assert parent.read_bytes() == before
+
+    objects.update(
+        _artifact(
+            middle.view(torch.uint8).numpy(),
+            target.view(torch.uint8).numpy(),
+            version="target-b",
+            version_label=3,
+            base_version="target-a",
+        )
+    )
+    second = adapter.stage_weight(
+        _inputs(None, base_version="target-a", version="target-b", version_label=3)
+    )
+    assert second.deferred is not None
+    assert second.path == store.materialized_path("target-a")
+    adapter.apply_weight(second)
+    adapter.release_staged_weight(second)
+    adapter._checkpoint.wait_deferred_persistence()
+
+    assert torch.equal(
+        load_file(store.materialized_path("target-b") / "model.safetensors")["weight"],
+        target,
+    )
+    assert json.loads((store.chain_cache / "target-b.json").read_text()) == {
+        "deltas": ["target-a", "target-b"],
+        "full_version": "base-a",
+        "version": "target-b",
+    }
+    adapter.close()
+
+
+def test_deferred_delta_is_reused_by_another_rank_without_downloading_again(
+    monkeypatch, tmp_path
+):
+    _deferred_env(monkeypatch)
+    base = torch.tensor([1.0, 2.0])
+    middle = torch.tensor([3.0, 4.0])
+    objects = _artifact(base.view(torch.uint8).numpy(), middle.view(torch.uint8).numpy())
+    adapter, storage = _build(monkeypatch, tmp_path, objects)
+
+    first = adapter.stage_weight(_inputs(None))
+    shard_calls = [c for c in storage.calls if c.endswith(".safetensors")]
+    from modelexpress_rl.inference.receiver import _S3Version
+
+    second = adapter._checkpoint.prepare_chain(
+        (
+            _S3Version(
+                version_id="target-a",
+                base_version_id="base-a",
+                payload_format=WeightPayloadFormat.XOR_DELTA,
+                uri="s3://weights/test/v1/model.safetensors.index.json",
+            ),
+        )
+    )
+
+    assert second.deferred is not None
+    assert second.target_version == "target-a"
+    assert [c for c in storage.calls if c.endswith(".safetensors")] == shard_calls
+    adapter._checkpoint.release(second)
+    adapter.apply_weight(first)
+    adapter.release_staged_weight(first)
+    adapter._checkpoint.wait_deferred_persistence()
+    assert adapter._checkpoint.store.state().version == "target-a"
+    adapter.close()
+
+
+def test_released_deferred_delta_without_activation_keeps_the_parent_cache(
+    monkeypatch, tmp_path
+):
+    _deferred_env(monkeypatch)
+    base = torch.tensor([1.0, 2.0])
+    middle = torch.tensor([3.0, 4.0])
+    objects = _artifact(base.view(torch.uint8).numpy(), middle.view(torch.uint8).numpy())
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    store = adapter._checkpoint.store
+
+    first = adapter.stage_weight(_inputs(None))
+    adapter.release_staged_weight(first)
+    adapter._checkpoint.wait_deferred_persistence()
+
+    assert store.state().version == "base-a"
+    assert not store.materialized_path("target-a").exists()
+    again = adapter.stage_weight(_inputs(None))
+    assert again.deferred is not None
+    adapter.release_staged_weight(again)
+    adapter.close()
+
+
+def test_next_stage_writes_an_activated_deferred_target_before_building_on_it(
+    monkeypatch, tmp_path
+):
+    _deferred_env(monkeypatch)
+    base = torch.tensor([1.0, 2.0])
+    middle = torch.tensor([3.0, 4.0])
+    target = torch.tensor([5.0, 6.0])
+    objects = _artifact(base.view(torch.uint8).numpy(), middle.view(torch.uint8).numpy())
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    store = adapter._checkpoint.store
+    monkeypatch.setattr(adapter._checkpoint, "_persist_deferred", lambda: None)
+
+    first = adapter.stage_weight(_inputs(None))
+    adapter.apply_weight(first)
+    adapter.release_staged_weight(first)
+    assert store.deferred()["activated"] is True
+    assert store.state().version == "base-a"
+
+    objects.update(
+        _artifact(
+            middle.view(torch.uint8).numpy(),
+            target.view(torch.uint8).numpy(),
+            version="target-b",
+            version_label=3,
+            base_version="target-a",
+        )
+    )
+    second = adapter.stage_weight(
+        _inputs(None, base_version="target-a", version="target-b", version_label=3)
+    )
+
+    assert torch.equal(
+        load_file(second.path / "model.safetensors")["weight"], middle
+    )
+    assert store.active_version() == "target-a"
+    assert store.deferred()["version"] == "target-b"
+    adapter.release_staged_weight(second)
+    adapter.close()
+
+
+def test_deferred_persistence_waits_for_every_rank_reading_the_parent(
+    monkeypatch, tmp_path
+):
+    from modelexpress_rl.inference.receiver import _S3Version
+
+    _deferred_env(monkeypatch)
+    base = torch.tensor([1.0, 2.0])
+    middle = torch.tensor([3.0, 4.0])
+    objects = _artifact(base.view(torch.uint8).numpy(), middle.view(torch.uint8).numpy())
+    adapter, _storage = _build(monkeypatch, tmp_path, objects)
+    store = adapter._checkpoint.store
+
+    first = adapter.stage_weight(_inputs(None))
+    other_rank = adapter._checkpoint.prepare_chain(
+        (
+            _S3Version(
+                version_id="target-a",
+                base_version_id="base-a",
+                payload_format=WeightPayloadFormat.XOR_DELTA,
+                uri="s3://weights/test/v1/model.safetensors.index.json",
+            ),
+        )
+    )
+    adapter.apply_weight(first)
+    adapter.release_staged_weight(first)
+    adapter._checkpoint._persistence.join(timeout=0.5)
+
+    assert adapter._checkpoint._persistence.is_alive()
+    assert store.state().version == "base-a"
+    adapter._checkpoint.release(other_rank)
+    adapter._checkpoint.wait_deferred_persistence()
+    assert store.state().version == "target-a"
+    adapter.close()
