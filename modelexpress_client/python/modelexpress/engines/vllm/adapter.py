@@ -229,6 +229,17 @@ def _select_draft_weight_files(
         return DraftShardSelection.UNRESOLVED, []
 
 
+def _own_buffered_indexer_tensors(
+    weights: Iterator[tuple[str, torch.Tensor]],
+) -> Iterator[tuple[str, torch.Tensor]]:
+    """Copy FP8 indexer wk tensors, which vLLM keeps until their pair arrives.
+
+    Streaming iterators may yield views into reused read buffers.
+    """
+    for name, tensor in weights:
+        yield name, tensor.clone() if ".indexer.wk." in name else tensor
+
+
 class VllmAdapter(EngineAdapter):
     """Adapter that maps strategy hooks onto vLLM's native loader APIs."""
 
@@ -333,7 +344,7 @@ class VllmAdapter(EngineAdapter):
     ) -> LoadResult:
         if result.model is None:
             raise RuntimeError("vLLM weight iterator loading requires result.model")
-        result.model.load_weights(weights_iter)
+        result.model.load_weights(_own_buffered_indexer_tensors(weights_iter))
         return result
 
     def build_model_streamer_weight_iter(

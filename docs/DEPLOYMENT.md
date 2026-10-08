@@ -1562,3 +1562,5 @@ vLLM buffers FP8 indexer `wk` weights and scales across `load_weights` calls unt
 both arrive. Every refit reload discards stale buffered entries first and fails
 with `IncompleteRefit` if a pair is still pending afterwards, because the fused
 indexer parameter was then not written.
+Streaming weight iterators may yield views into reused read buffers, so the vLLM
+adapter copies FP8 indexer `wk` tensors before vLLM buffers them for pairing.
