@@ -344,3 +344,51 @@ def test_streamed_full_checkpoint_tracks_lineage_only_after_success(
     assert fake_vllm.full == []
     assert model.loads == [["mlp.gate_proj.weight", "mlp.up_proj.weight"]]
     assert metrics["perf/mx_receive_surgical_fallback"] == 0
+
+
+def test_stale_fp8_indexer_entries_are_cleared_before_reload(
+    fake_vllm, tmp_path, caplog
+):
+    path = _checkpoint(tmp_path)
+    model = _Model()
+    seen = []
+    original = model.load_weights
+
+    def load_weights(weights):
+        seen.append(dict(model._pending_indexer_wk_fp8))
+        return original(weights)
+
+    model.load_weights = load_weights
+    installer = _installer(model)
+    installer.install(_prepared(path, "v1"))
+    model._pending_indexer_wk_fp8 = {
+        "model.layers.0.self_attn.indexer": {"weight": torch.zeros(2)}
+    }
+
+    with caplog.at_level(logging.WARNING):
+        installer.install(_prepared(path, "v2", V2))
+
+    assert seen[-1] == {}
+    assert "model.layers.0.self_attn.indexer" in caplog.text
+
+
+def test_reload_fails_when_an_fp8_indexer_pair_is_left_pending(fake_vllm, tmp_path):
+    from modelexpress.refit.reshard.types import IncompleteRefit
+
+    path = _checkpoint(tmp_path)
+    model = _Model()
+    installer = _installer(model)
+    installer.install(_prepared(path, "v1"))
+    original = model.load_weights
+
+    def load_weights(weights):
+        result = original(weights)
+        model._pending_indexer_wk_fp8 = {
+            "model.layers.1.self_attn.indexer": {"scale": torch.ones(1)}
+        }
+        return result
+
+    model.load_weights = load_weights
+
+    with pytest.raises(IncompleteRefit, match="model.layers.1.self_attn.indexer"):
+        installer.install(_prepared(path, "v2", V2))
