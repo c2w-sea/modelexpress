@@ -1239,3 +1239,40 @@ class TestReadSafetensorsIndexObjectStore:
             DraftShardSelection.SELECTED,
             ["s3://bucket/model/model-mtp.safetensors"],
         )
+
+
+def test_apply_weight_iter_gives_buffered_fp8_indexer_tensors_owned_storage():
+    """vLLM holds FP8 indexer wk tensors across iterations until the pair arrives."""
+    import torch
+
+    from modelexpress.engines.vllm.adapter import VllmAdapter
+    from modelexpress.load_strategy.context import LoadResult
+
+    buffer = torch.zeros(4, dtype=torch.uint8)
+
+    def streamer():
+        # Every yielded tensor is a view into one reused read buffer.
+        for name, value in [
+            ("model.layers.1.self_attn.indexer.wk.weight", 7),
+            ("model.layers.1.self_attn.indexer.weights_proj.weight", 8),
+            ("model.layers.1.self_attn.indexer.wk.weight_scale_inv", 9),
+        ]:
+            buffer.fill_(value)
+            yield name, buffer[:]
+
+    class Model:
+        def __init__(self):
+            self.kept = {}
+
+        def load_weights(self, weights):
+            for name, tensor in weights:
+                if ".indexer.wk." in name:
+                    self.kept[name] = tensor
+            return set()
+
+    model = Model()
+    adapter = object.__new__(VllmAdapter)
+    adapter.apply_weight_iter(LoadResult(value=model, model=model), streamer())
+
+    assert model.kept["model.layers.1.self_attn.indexer.wk.weight"].tolist() == [7] * 4
+    assert model.kept["model.layers.1.self_attn.indexer.wk.weight_scale_inv"].tolist() == [9] * 4
