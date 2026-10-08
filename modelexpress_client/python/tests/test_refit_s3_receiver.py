@@ -14,7 +14,6 @@ from unittest.mock import Mock, patch
 import pytest
 import safetensors.numpy
 import safetensors.torch
-import s3transfer.manager
 import torch
 import zstandard
 from safetensors.torch import load_file, save_file
@@ -87,24 +86,6 @@ class _TransferFuture:
         pass
 
 
-class _TransferManager:
-    def __init__(self, client, config):
-        self.client = client
-        self.config = config
-
-    def download(self, bucket, key, target):
-        response = self.client.get_object(Bucket=bucket, Key=key)
-        body = response["Body"]
-        try:
-            target.write(body.read())
-        finally:
-            body.close()
-        return _TransferFuture()
-
-    def shutdown(self):
-        pass
-
-
 class _Body:
     def __init__(self, data):
         self.data = data
@@ -129,8 +110,13 @@ class _S3Backend:
         put_error=None,
         complete_error=None,
         barrier=None,
+        honor_range=True,
+        short_parts=(),
     ):
         self.data = data
+        self.honor_range = honor_range
+        self.short_parts = set(short_parts)
+        self.etag = '"etag-object"'
         self.put_error = put_error
         self.complete_error = complete_error
         self.barrier = barrier
@@ -150,7 +136,21 @@ class _S3Backend:
     def get_object(self, **request):
         self.get_request = request
         self.get_requests.append(request)
-        return {"Body": _Body(self.data)}
+        if "IfMatch" in request and request["IfMatch"] != self.etag:
+            raise _S3Error("PreconditionFailed")
+        if not self.honor_range or "Range" not in request:
+            return {"Body": _Body(self.data), "ETag": self.etag}
+        start, end = (int(v) for v in request["Range"].removeprefix("bytes=").split("-"))
+        end = min(end, len(self.data) - 1)
+        body = self.data[start : end + 1]
+        if start in self.short_parts:
+            self.short_parts.discard(start)
+            body = body[:-1]
+        return {
+            "Body": _Body(body),
+            "ETag": self.etag,
+            "ContentRange": f"bytes {start}-{end}/{len(self.data)}",
+        }
 
     def head_object(self, **request):
         self.head_request = request
@@ -176,11 +176,6 @@ class _S3Backend:
 
     def close(self):
         pass
-
-
-@pytest.fixture(autouse=True)
-def _transfer_manager(monkeypatch):
-    monkeypatch.setattr(s3transfer.manager, "TransferManager", _TransferManager)
 
 
 class _Adapter:
@@ -253,17 +248,117 @@ class _Adapter:
         self._method.close()
 
 
-def test_s3_read_parses_uri():
+def _ranged_client(monkeypatch, backend, *, range_bytes=1024, threshold=4096, workers=3):
+    import boto3
+
+    monkeypatch.setenv("MX_S3_DOWNLOAD_RANGE_BYTES", str(range_bytes))
+    monkeypatch.setenv("MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES", str(threshold))
+    monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", str(workers))
+    monkeypatch.setattr(boto3, "client", lambda *_args, **_kwargs: backend)
+    return S3Client()
+
+
+def test_s3_read_parses_uri(monkeypatch):
     data = b"canonical-root"
     backend = _S3Backend(data)
-    s3 = object.__new__(S3Client)
-    s3._client = backend
-    s3._download_manager = _TransferManager(backend, None)
-    assert s3.get("s3://weights/root.json") == data
-    assert backend.get_request == {
-        "Bucket": "weights",
-        "Key": "root.json",
-    }
+    s3 = _ranged_client(monkeypatch, backend)
+    try:
+        assert s3.get("s3://weights/root.json") == data
+    finally:
+        s3.close()
+    assert backend.get_requests == [
+        {"Bucket": "weights", "Key": "root.json", "Range": "bytes=0-1023"}
+    ]
+
+
+def test_s3_get_fills_large_object_with_parallel_pinned_ranges(monkeypatch):
+    data = bytes(range(256)) * 40
+    backend = _S3Backend(data)
+    s3 = _ranged_client(monkeypatch, backend)
+    try:
+        result = s3.get("s3://weights/delta.safetensors")
+    finally:
+        s3.close()
+    assert result == data and isinstance(result, bytes)
+    first, *rest = backend.get_requests
+    assert first == {"Bucket": "weights", "Key": "delta.safetensors", "Range": "bytes=0-1023"}
+    assert sorted(r["Range"] for r in rest) == sorted(
+        f"bytes={start}-{min(start + 1024, len(data)) - 1}"
+        for start in range(1024, len(data), 1024)
+    )
+    assert all(r["IfMatch"] == backend.etag for r in rest)
+
+
+def test_s3_get_fetches_remainder_once_below_range_threshold(monkeypatch):
+    data = b"x" * 3000
+    backend = _S3Backend(data)
+    s3 = _ranged_client(monkeypatch, backend)
+    try:
+        assert s3.get("s3://weights/index.json") == data
+    finally:
+        s3.close()
+    assert [r["Range"] for r in backend.get_requests] == ["bytes=0-1023", "bytes=1024-2999"]
+
+
+def test_s3_get_accepts_whole_object_when_range_is_ignored(monkeypatch):
+    data = b"y" * 5000
+    backend = _S3Backend(data, honor_range=False)
+    s3 = _ranged_client(monkeypatch, backend)
+    try:
+        assert s3.get("s3://weights/whole") == data
+    finally:
+        s3.close()
+    assert len(backend.get_requests) == 1
+
+
+def test_s3_get_reads_an_empty_object_without_a_range(monkeypatch):
+    backend = _S3Backend(b"")
+    original = backend.get_object
+
+    def unsatisfiable(**request):
+        if "Range" in request:
+            backend.get_requests.append(request)
+            raise _S3Error("InvalidRange")
+        return original(**request)
+
+    backend.get_object = unsatisfiable
+    s3 = _ranged_client(monkeypatch, backend)
+    try:
+        assert s3.get("s3://weights/empty") == b""
+    finally:
+        s3.close()
+    assert [("Range" in r) for r in backend.get_requests] == [True, False]
+
+
+def test_s3_get_retries_a_short_part_then_succeeds(monkeypatch):
+    data = b"z" * 5000
+    backend = _S3Backend(data, short_parts={2048})
+    s3 = _ranged_client(monkeypatch, backend)
+    try:
+        assert s3.get("s3://weights/delta") == data
+    finally:
+        s3.close()
+    assert [r["Range"] for r in backend.get_requests].count("bytes=2048-3071") == 2
+
+
+def test_s3_get_does_not_retry_a_changed_object(monkeypatch):
+    backend = _S3Backend(b"w" * 5000)
+    s3 = _ranged_client(monkeypatch, backend)
+    original = backend.get_object
+
+    def changed(**request):
+        response = original(**request)
+        backend.etag = '"etag-changed"'
+        return response
+
+    backend.get_object = changed
+    try:
+        with pytest.raises(_S3Error):
+            s3.get("s3://weights/delta")
+    finally:
+        s3.close()
+    pinned = [r for r in backend.get_requests if "IfMatch" in r]
+    assert pinned and len({r["Range"] for r in pinned}) == len(pinned)
 
 
 def test_s3_size_reads_object_content_length():
@@ -297,7 +392,10 @@ def test_s3_write_accepts_only_an_identical_immutable_retry():
     s3 = object.__new__(S3Client)
     s3._client = backend
     s3._multipart_threshold_bytes = 100
-    s3._download_manager = _TransferManager(backend, None)
+    s3._range_bytes = 1024
+    s3._range_threshold_bytes = 4096
+    s3._max_attempts = 1
+    s3._download_pool = ThreadPoolExecutor(max_workers=1)
     s3.put(uri="s3://weights/root.json", data=b"same")
     with pytest.raises(ImmutableS3Conflict):
         s3.put(uri="s3://weights/root.json", data=b"different")
@@ -318,8 +416,6 @@ def test_s3_client_uses_transfer_connection_and_retry_settings(monkeypatch):
     monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", "3")
     monkeypatch.setenv("MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES", "4096")
     monkeypatch.setenv("MX_S3_DOWNLOAD_RANGE_BYTES", "1024")
-    monkeypatch.setenv("MX_S3_DOWNLOAD_IO_CHUNK_BYTES", "512")
-    monkeypatch.setenv("MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS", "7")
     monkeypatch.setenv("MX_S3_MAX_POOL_CONNECTIONS", "17")
     monkeypatch.setenv("MX_S3_MAX_ATTEMPTS", "6")
     monkeypatch.setenv("MX_S3_TCP_KEEPALIVE", "false")
@@ -332,14 +428,10 @@ def test_s3_client_uses_transfer_connection_and_retry_settings(monkeypatch):
         assert config.retries == {"total_max_attempts": 6, "mode": "standard"}
         assert config.tcp_keepalive is False
         assert s3._upload_pool._max_workers == 2
-        transfer = s3._download_manager.config
-        assert transfer.multipart_threshold == 4096
-        assert transfer.multipart_chunksize == 1024
-        assert transfer.max_request_concurrency == 3
-        assert transfer.io_chunksize == 512
-        assert transfer.max_io_queue_size == 7
-        assert transfer.max_in_memory_download_chunks == 7
-        assert transfer.num_download_attempts == 6
+        assert s3._range_threshold_bytes == 4096
+        assert s3._range_bytes == 1024
+        assert s3._download_pool._max_workers == 3
+        assert s3._max_attempts == 6
     finally:
         s3.close()
 

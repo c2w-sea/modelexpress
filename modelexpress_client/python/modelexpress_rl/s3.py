@@ -6,8 +6,8 @@
 from __future__ import annotations
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, wait
-from io import BytesIO
 from urllib.parse import urlsplit
 
 from modelexpress_rl import envs as rl_envs
@@ -16,6 +16,7 @@ from modelexpress_rl import envs as rl_envs
 _MIN_MULTIPART_PART_BYTES = 5 * 1024**2
 _MAX_MULTIPART_PART_BYTES = 5 * 1024**3
 _MAX_MULTIPART_PARTS = 10_000
+_CONTENT_RANGE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +46,13 @@ def _parse_uri(uri: str) -> tuple[str, str]:
     return parsed.netloc, parsed.path[1:]
 
 
+def _read_body(body) -> bytes:
+    try:
+        return body.read()
+    finally:
+        body.close()
+
+
 class S3Client:
     """Small immutable S3 client for canonical refit artifacts."""
 
@@ -56,7 +64,6 @@ class S3Client:
     ) -> None:
         import boto3
         from botocore.config import Config as BotoConfig
-        from s3transfer.manager import TransferConfig, TransferManager
 
         self._multipart_threshold_bytes = rl_envs.MX_S3_MULTIPART_THRESHOLD_BYTES
         self._upload_part_bytes = rl_envs.MX_S3_UPLOAD_PART_BYTES
@@ -83,19 +90,13 @@ class S3Client:
             max_workers=rl_envs.MX_S3_UPLOAD_WORKERS,
             thread_name_prefix="modelexpress-s3-upload",
         )
-        self._download_manager = TransferManager(
-            self._client,
-            config=TransferConfig(
-                multipart_threshold=rl_envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES,
-                multipart_chunksize=rl_envs.MX_S3_DOWNLOAD_RANGE_BYTES,
-                max_request_concurrency=rl_envs.MX_S3_DOWNLOAD_WORKERS,
-                io_chunksize=rl_envs.MX_S3_DOWNLOAD_IO_CHUNK_BYTES,
-                max_io_queue_size=(rl_envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS),
-                max_in_memory_download_chunks=(
-                    rl_envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS
-                ),
-                num_download_attempts=rl_envs.MX_S3_MAX_ATTEMPTS,
-            ),
+        self._range_bytes = rl_envs.MX_S3_DOWNLOAD_RANGE_BYTES
+        self._range_threshold_bytes = rl_envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES
+        self._max_attempts = rl_envs.MX_S3_MAX_ATTEMPTS
+        # Range parts never submit work, so callers on other pools cannot deadlock.
+        self._download_pool = ThreadPoolExecutor(
+            max_workers=rl_envs.MX_S3_DOWNLOAD_WORKERS,
+            thread_name_prefix="modelexpress-s3-range",
         )
 
     def put(self, *, uri: str, data: bytes) -> None:
@@ -184,11 +185,71 @@ class S3Client:
                 ) from error
 
     def get(self, uri: str) -> bytes:
-        """Read one S3 object."""
+        """Read one S3 object into a preallocated buffer with ranged GETs.
+
+        The first range reports the object size and ETag; remaining ranges are
+        pinned to that ETag and fetched in parallel when the object is large.
+        """
         bucket, key = _parse_uri(uri)
-        target = BytesIO()
-        self._download_manager.download(bucket, key, target).result()
-        return target.getvalue()
+        try:
+            response = self._client.get_object(
+                Bucket=bucket, Key=key, Range=f"bytes=0-{self._range_bytes - 1}"
+            )
+        except Exception as error:
+            if _error_code(error) not in {"416", "InvalidRange"}:
+                raise
+            # An empty object has no satisfiable range.
+            return _read_body(self._client.get_object(Bucket=bucket, Key=key)["Body"])
+        head = _read_body(response["Body"])
+        match = _CONTENT_RANGE.match(response.get("ContentRange") or "")
+        if match is None:
+            # The server ignored the range and returned the whole object.
+            return head
+        total = int(match.group(3))
+        if len(head) != int(match.group(2)) - int(match.group(1)) + 1:
+            raise RuntimeError(f"short S3 range read for {bucket}/{key}")
+        if total == len(head):
+            return head
+        etag = response["ETag"]
+        buffer = bytearray(total)
+        view = memoryview(buffer)
+        view[: len(head)] = head
+        step = self._range_bytes if total >= self._range_threshold_bytes else total
+        ranges = [
+            (start, min(start + step, total)) for start in range(len(head), total, step)
+        ]
+
+        def fetch(span: tuple[int, int]) -> None:
+            start, end = span
+            for attempt in range(self._max_attempts):
+                try:
+                    part = self._client.get_object(
+                        Bucket=bucket,
+                        Key=key,
+                        Range=f"bytes={start}-{end - 1}",
+                        IfMatch=etag,
+                    )
+                    data = _read_body(part["Body"])
+                    if len(data) != end - start:
+                        raise RuntimeError(f"short S3 range read for {bucket}/{key}")
+                except Exception as error:
+                    if (
+                        _error_code(error) in {"412", "PreconditionFailed"}
+                        or attempt == self._max_attempts - 1
+                    ):
+                        raise
+                    continue
+                view[start:end] = data
+                return
+
+        futures = [self._download_pool.submit(fetch, span) for span in ranges]
+        try:
+            for future in futures:
+                future.result()
+        except Exception:
+            wait(futures)
+            raise
+        return bytes(buffer)
 
     def size(self, uri: str) -> int:
         """Return one S3 object's byte size without downloading its payload."""
@@ -198,7 +259,7 @@ class S3Client:
     def close(self) -> None:
         """Close the underlying SDK client when supported."""
         self._upload_pool.shutdown()
-        self._download_manager.shutdown()
+        self._download_pool.shutdown()
         close = getattr(self._client, "close", None)
         if close is not None:
             close()
