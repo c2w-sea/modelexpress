@@ -1276,3 +1276,68 @@ def test_apply_weight_iter_gives_buffered_fp8_indexer_tensors_owned_storage():
 
     assert model.kept["model.layers.1.self_attn.indexer.wk.weight"].tolist() == [7] * 4
     assert model.kept["model.layers.1.self_attn.indexer.wk.weight_scale_inv"].tolist() == [9] * 4
+
+
+class _IndexerBufferingModel:
+    """Mimics vLLM's FP8 indexer wk pairing; ``drop_after`` strands one pair."""
+
+    def __init__(self, drop_after=None):
+        self._pending_indexer_wk_fp8 = {}
+        self.written = {}
+        self.drop_after = drop_after
+
+    def load_weights(self, weights):
+        for name, tensor in weights:
+            if ".indexer.wk." not in name:
+                continue
+            prefix = name.rsplit(".wk.", 1)[0]
+            entry = self._pending_indexer_wk_fp8.setdefault(prefix, {})
+            entry["scale" if "weight_scale" in name else "weight"] = tensor
+            if name == self.drop_after:
+                self.drop_after = None
+                self._pending_indexer_wk_fp8.clear()
+                continue
+            if "weight" in entry and "scale" in entry:
+                pair = self._pending_indexer_wk_fp8.pop(prefix)
+                self.written[prefix] = (pair["weight"].tolist(), pair["scale"].tolist())
+        return set()
+
+
+def _indexer_stream(layers=(0, 1)):
+    import torch
+
+    for layer in layers:
+        prefix = f"model.layers.{layer}.self_attn.indexer"
+        yield f"{prefix}.wk.weight", torch.full((2,), layer + 1, dtype=torch.uint8)
+        yield f"{prefix}.weights_proj.weight", torch.zeros(2)
+        yield f"{prefix}.wk.weight_scale_inv", torch.full((1,), layer + 10, dtype=torch.uint8)
+
+
+def test_apply_weight_iter_rewrites_fp8_indexer_pairs_stranded_by_the_stream():
+    from modelexpress.engines.vllm.adapter import VllmAdapter
+    from modelexpress.load_strategy.context import LoadResult
+
+    model = _IndexerBufferingModel(drop_after="model.layers.1.self_attn.indexer.wk.weight")
+    adapter = object.__new__(VllmAdapter)
+    adapter.apply_weight_iter(LoadResult(value=model, model=model), _indexer_stream())
+
+    assert model.written["model.layers.0.self_attn.indexer"] == ([1, 1], [10])
+    assert model.written["model.layers.1.self_attn.indexer"] == ([2, 2], [11])
+    assert model._pending_indexer_wk_fp8 == {}
+
+
+def test_apply_weight_iter_rejects_an_fp8_indexer_weight_without_its_scale():
+    import pytest
+
+    from modelexpress.engines.vllm.adapter import VllmAdapter
+    from modelexpress.load_strategy.context import LoadResult
+
+    def stream():
+        for name, tensor in _indexer_stream():
+            if name != "model.layers.1.self_attn.indexer.wk.weight_scale_inv":
+                yield name, tensor
+
+    model = _IndexerBufferingModel()
+    adapter = object.__new__(VllmAdapter)
+    with pytest.raises(RuntimeError, match="model.layers.1.self_attn.indexer"):
+        adapter.apply_weight_iter(LoadResult(value=model, model=model), stream())
