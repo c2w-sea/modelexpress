@@ -12,21 +12,26 @@ by compiled CUDA graphs.
 
 from __future__ import annotations
 
+import collections
 import copy
 import hashlib
 import logging
+import mmap
 import time
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from inspect import getattr_static
 from pathlib import Path
 from types import GetSetDescriptorType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from modelexpress.accelerators import accelerator_backend_for
+from modelexpress.gds_loader import SAFETENSORS_DTYPE_MAP
 from modelexpress.engines.vllm.host_quantization import (
     refresh_host_quantization_state,
 )
@@ -52,8 +57,12 @@ from modelexpress_rl.inference.plan import (
     PreparedRuntimeTensors,
     PreparedStreamingTensors,
 )
-from modelexpress_rl.inference.receiver import PreparedCheckpoint
-from modelexpress_rl.utils import index_checkpoint_tensors
+from modelexpress_rl.inference.receiver import (
+    DeferredDelta,
+    PreparedCheckpoint,
+    reconstruct_delta_tensor,
+)
+from modelexpress_rl.utils import index_checkpoint_tensors, read_safetensors_header
 
 if TYPE_CHECKING:
     from modelexpress.refit.reshard.types import CaptureResult
@@ -705,10 +714,17 @@ class _VllmInstaller(EngineInstaller):
                 if rl_envs.MX_REFIT_DELTA_SURGICAL
                 else None
             )
+            if changed is None and checkpoint.deferred is not None:
+                # The target exists only in memory: reload every tensor from it.
+                changed = frozenset(index_checkpoint_tensors(checkpoint.path)[1])
             if changed is None:
                 self.install_checkpoint(checkpoint.path)
             else:
-                metrics.update(self.install_changed_tensors(checkpoint.path, changed))
+                metrics.update(
+                    self.install_changed_tensors(
+                        checkpoint.path, changed, deferred=checkpoint.deferred
+                    )
+                )
             self._live_version = checkpoint.target_version
         else:
             raise TypeError(f"unsupported prepared artifact {type(prepared).__name__}")
@@ -1063,14 +1079,20 @@ class _VllmInstaller(EngineInstaller):
             torch.cuda.synchronize(self._device)
 
     def install_changed_tensors(
-        self, path: str | Path, changed: frozenset[str]
+        self,
+        path: str | Path,
+        changed: frozenset[str],
+        *,
+        deferred: DeferredDelta | None = None,
     ) -> dict[str, float]:
         """Reload only the modules whose checkpoint tensors a delta changed.
 
         Untouched layers receive no weights, so vLLM's finalize places their
         existing kernel tensors back. If a fed module is still incomplete and
         checkpoint weights remain, stream them through the same reload. Partial
-        counts after complete coverage are left to vLLM finalization.
+        counts after complete coverage are left to vLLM finalization. With a
+        deferred delta, ``path`` is the parent and the delta's tensors are
+        reconstructed in memory.
         """
         from safetensors import safe_open
         from vllm.model_executor.layers.attention import is_deferred_attention_layer
@@ -1091,6 +1113,11 @@ class _VllmInstaller(EngineInstaller):
         fallback = False
 
         def subset():
+            if deferred is not None:
+                ordered = [name for file_names in by_file.values() for name in file_names]
+                metadata = index_checkpoint_tensors(path)[2]
+                yield from _DeferredOverlay(deferred, locations, metadata).tensors(ordered)
+                return
             for file, file_names in by_file.items():
                 with safe_open(str(file), framework="pt") as tensors:
                     for name in file_names:
@@ -1449,6 +1476,80 @@ class _VllmInstaller(EngineInstaller):
                 "vLLM refit left parameters on the meta device; "
                 f"count={len(meta_parameters)}, names={meta_parameters[:10]}"
             )
+
+
+class _DeferredOverlay:
+    """Target tensors of a deferred delta, rebuilt in parallel from the parent.
+
+    Parent bytes come from a read-only mmap. Tensors are built ahead on a pool
+    and yielded in order with a bounded number in flight.
+    """
+
+    def __init__(
+        self,
+        deferred: DeferredDelta,
+        locations: dict[str, tuple[Path, int, int]],
+        metadata: dict[str, dict],
+    ) -> None:
+        self._deferred = deferred
+        self._locations = locations
+        self._metadata = metadata
+        self._shards: dict[str, tuple[dict, int, bytes]] = {}
+        self._maps: dict[Path, tuple[Any, mmap.mmap]] = {}
+
+    def _payload(self, name: str) -> tuple[memoryview, str]:
+        filename = self._deferred.weight_map[name]
+        header, start, data = self._shards[filename]
+        begin, end = header[name]["data_offsets"]
+        return memoryview(data)[start + begin : start + end], header["__metadata__"][name]
+
+    def _build(self, name: str) -> torch.Tensor:
+        path, offset, size = self._locations[name]
+        parent = memoryview(self._maps[path][1])[offset : offset + size]
+        if name in self._deferred.weight_map:
+            compressed, checksum = self._payload(name)
+            data = reconstruct_delta_tensor(
+                parent,
+                compressed,
+                compression_format=self._deferred.index_metadata["compression_format"],
+                checksum_format=self._deferred.index_metadata["checksum_format"],
+                expected_checksum=checksum,
+            )
+        else:
+            data = bytearray(parent)
+        info = self._metadata[name]
+        return (
+            torch.frombuffer(data, dtype=torch.uint8)
+            .view(SAFETENSORS_DTYPE_MAP[info["dtype"]])
+            .reshape(info["shape"])
+        )
+
+    def tensors(self, names: list[str]) -> Iterator[tuple[str, torch.Tensor]]:
+        for filename in set(self._deferred.weight_map.values()):
+            data = (self._deferred.artifact / filename).read_bytes()
+            header, start = read_safetensors_header(data, repr(filename))
+            self._shards[filename] = (header, start, data)
+        try:
+            for path in {self._locations[name][0] for name in names}:
+                handle = path.open("rb")
+                self._maps[path] = (handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ))
+            workers = max(1, rl_envs.MX_REFIT_DELTA_WORKERS)
+            window: collections.deque = collections.deque()
+            with ThreadPoolExecutor(workers, thread_name_prefix="modelexpress-deferred") as pool:
+                for name in names:
+                    window.append((name, pool.submit(self._build, name)))
+                    if len(window) >= 2 * workers:
+                        done, future = window.popleft()
+                        yield done, future.result()
+                while window:
+                    done, future = window.popleft()
+                    yield done, future.result()
+        finally:
+            for handle, mapped in self._maps.values():
+                mapped.close()
+                handle.close()
+            self._maps.clear()
+            self._shards.clear()
 
 
 # vLLM DeepSeek-V3.2/GLM buffers FP8 indexer wk and its scale here until both
