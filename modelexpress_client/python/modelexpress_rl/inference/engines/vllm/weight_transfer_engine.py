@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, field
 from time import perf_counter
 from typing import Any
 
@@ -18,13 +18,13 @@ from vllm.distributed.weight_transfer.base import (
 )
 
 from modelexpress import envs
+from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.client import (
     ModelExpressGeneratorClient,
     ModelExpressGeneratorConfig,
     StagedWeightHandle,
 )
 from modelexpress_rl.inference.receiver import (
-    DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB,
     ObjectStorageGeneratorConfig,
 )
 from modelexpress_rl.object_storage import ObjectStorageType
@@ -44,7 +44,9 @@ class ModelExpressWeightTransferInitInfo(WeightTransferInitInfo):
     initial_base_version_id: str | None = None
     seed_checkpoint_path: str | None = None
     refit_checkpoint_dir: str | None = None
-    refit_checkpoint_max_size_gb: int | None = DEFAULT_REFIT_CHECKPOINT_MAX_SIZE_GB
+    refit_checkpoint_max_size_gb: int | None = field(
+        default_factory=lambda: rl_envs.MX_REFIT_CHECKPOINT_MAX_SIZE_GB
+    )
     server_url: str | None = None
     object_storage_type: str | None = None
     object_storage_endpoint_url: str | None = None
@@ -96,6 +98,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
             vllm_config.model_config, "model", None
         )
         self._client: ModelExpressGeneratorClient | None = None
+        self._init_context: dict[str, Any] | None = None
         self._update_active = False
         self._active_version_id: str | None = None
         self._staged: StagedWeightHandle | None = None
@@ -107,8 +110,20 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
         """Initialize ModelExpress from the rank-local vLLM model context."""
         if self._closed:
             raise RuntimeError("weight transfer engine is shut down")
+        init_context = asdict(init_info)
+        for hint in (
+            "initial_base_version_id", "initial_serving_version_id", "seed_checkpoint_path"
+        ):
+            init_context.pop(hint)
         if self._client is not None:
-            raise RuntimeError("weight transfer engine is already initialized")
+            if not rl_envs.MX_REFIT_IDEMPOTENT_INIT:
+                raise RuntimeError("weight transfer engine is already initialized")
+            if self._update_active:
+                raise RuntimeError("weight update is already active")
+            if init_context != self._init_context:
+                raise RuntimeError("weight transfer engine configuration changed")
+            logger.info("ModelExpress weight transfer initialization reused existing client")
+            return
 
         object_storage_values = (
             init_info.object_storage_type,
@@ -168,6 +183,7 @@ class ModelExpressWeightTransferEngine(WeightTransferEngine):
                 initial_serving_version_id=init_info.initial_serving_version_id,
             )
         )
+        self._init_context = init_context
         logger.info("ModelExpress weight transfer initialized model=%s", model_name)
 
     def start_weight_update(self) -> None:

@@ -434,3 +434,65 @@ def test_vllm_plugin_registers_weight_transfer_engine(monkeypatch):
             "ModelExpressWeightTransferEngine",
         )
     ]
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_checkpoint_quota_env_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("MX_REFIT_CHECKPOINT_MAX_SIZE_GB", value)
+    with pytest.raises(ValueError, match="MX_REFIT_CHECKPOINT_MAX_SIZE_GB"):
+        ModelExpressWeightTransferEngine.init_info_cls()
+
+
+def test_checkpoint_quota_env_default_and_explicit_override(monkeypatch):
+    info = ModelExpressWeightTransferEngine.init_info_cls
+    monkeypatch.delenv("MX_REFIT_CHECKPOINT_MAX_SIZE_GB", raising=False)
+    assert info().refit_checkpoint_max_size_gb == 2000
+    monkeypatch.setenv("MX_REFIT_CHECKPOINT_MAX_SIZE_GB", "3000")
+    assert info().refit_checkpoint_max_size_gb == 3000
+    assert info(refit_checkpoint_max_size_gb=1000).refit_checkpoint_max_size_gb == 1000
+    assert info(refit_checkpoint_max_size_gb=None).refit_checkpoint_max_size_gb is None
+
+
+def test_idempotent_init_preserves_client_across_updates(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_IDEMPOTENT_INIT", "true")
+    engine, client = _engine(monkeypatch, initialize=False)
+    initialize = MagicMock(return_value=client)
+    monkeypatch.setattr(weight_transfer_engine.ModelExpressGeneratorClient,
+                        "initialize", initialize)
+    for base, version in [("base-a", "base-a"), ("base-b", "base-b"),
+                          ("base-b", "delta-c")]:
+        engine.init_transfer_engine(engine.init_info_cls(
+            initial_base_version_id=base, initial_serving_version_id=version,
+            seed_checkpoint_path="/seed/" + base, object_storage_type="S3",
+            refit_checkpoint_dir="/cache"))
+        engine.start_weight_update()
+        engine.update_weights({"version_id": version})
+        engine.finish_weight_update()
+        assert engine._client is client
+    initialize.assert_called_once()
+    client.close.assert_not_called()
+    assert client.stage_weight.call_count == 3
+
+
+@pytest.mark.parametrize("changed", [
+    {"model_name": "different-model"}, {"server_url": "other:8001"},
+    {"refit_checkpoint_dir": "/other-cache"}, {"lease_ttl_seconds": 123},
+    {"refit_checkpoint_max_size_gb": 3000},
+])
+def test_idempotent_init_rejects_configuration_change(monkeypatch, changed):
+    monkeypatch.setenv("MX_REFIT_IDEMPOTENT_INIT", "true")
+    engine, client = _engine(monkeypatch)
+    with pytest.raises(RuntimeError, match="configuration changed"):
+        engine.init_transfer_engine(engine.init_info_cls(**changed))
+    assert engine._client is client
+
+
+def test_idempotent_init_rejects_active_update_and_shutdown(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_IDEMPOTENT_INIT", "true")
+    engine, _ = _engine(monkeypatch)
+    engine.start_weight_update()
+    with pytest.raises(RuntimeError, match="weight update is already active"):
+        engine.init_transfer_engine(engine.init_info_cls())
+    engine.shutdown()
+    with pytest.raises(RuntimeError, match="shut down"):
+        engine.init_transfer_engine(engine.init_info_cls())
