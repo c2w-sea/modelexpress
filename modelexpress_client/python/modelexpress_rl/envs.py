@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     MX_AZURE_READ_TIMEOUT_SECONDS: int
     MX_REFIT_CHECKSUM_FORMAT: str
     MX_REFIT_DESIRED_VERSION_UID: str | None
+    MX_REFIT_IDEMPOTENT_INIT: bool
     MX_REFIT_CHECKPOINT_DIR: str | None
     MX_REFIT_DELTA_BUCKET_BYTES: int
     MX_REFIT_DELTA_WORKERS: int
@@ -98,6 +99,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "MX_REFIT_DESIRED_VERSION_UID": lambda: (
         os.environ.get("MX_REFIT_DESIRED_VERSION_UID", "").strip() or None
+    ),
+    "MX_REFIT_IDEMPOTENT_INIT": lambda: parse_bool(
+        os.environ.get("MX_REFIT_IDEMPOTENT_INIT", "false"),
+        "MX_REFIT_IDEMPOTENT_INIT",
     ),
     "MX_REFIT_CHECKPOINT_DIR": lambda: (
         os.environ.get("MX_REFIT_CHECKPOINT_DIR", "").strip() or None
