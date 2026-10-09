@@ -11,6 +11,7 @@ expert are eligible; other modules keep the whole-module reload.
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -28,6 +29,8 @@ _PROJS = ("gate_proj", "up_proj", "down_proj")
 _KINDS = ("weight", "weight_scale_inv")
 _PER_EXPERT_BACKENDS = frozenset({"FLASHINFER_TRTLLM"})
 _CHUNK = 32
+
+logger = logging.getLogger(__name__)
 
 
 class ExpertPatchError(RuntimeError):
@@ -58,6 +61,37 @@ def _live_tensors(module: nn.Module) -> list[torch.Tensor]:
     ]
 
 
+def _scale_copies(module: nn.Module) -> list[list[torch.Tensor]] | None:
+    """Every live copy of the w13 and w2 scales.
+
+    A layerwise reload rebuilds the MoE kernel config from temporary tensors and
+    then restores the layer's original storage, so eager calls read the config's
+    copy while captured graphs and P2P read the layer's.
+    """
+    _w13, _w2, w13_scale, w2_scale = _live_tensors(module)
+    config = getattr(module.quant_method, "moe_quant_config", None)
+    copies = []
+    for own, kernel in ((w13_scale, getattr(config, "w1_scale", None)),
+                        (w2_scale, getattr(config, "w2_scale", None))):
+        if not isinstance(kernel, torch.Tensor):
+            return None
+        if kernel.data_ptr() == own.data_ptr():
+            copies.append([own])
+        elif (kernel.shape, kernel.dtype, kernel.device) == (own.shape, own.dtype, own.device):
+            copies.append([own, kernel])
+        else:
+            return None
+    return copies
+
+
+def _write_targets(module: nn.Module) -> list[list[torch.Tensor]]:
+    copies = _scale_copies(module)
+    if copies is None:
+        raise ExpertPatchError("MoE kernel scales do not match the layer's scale tensors")
+    w13, w2, _s13, _s2 = _live_tensors(module)
+    return [[w13], [w2], *copies]
+
+
 def _patchable(module: nn.Module) -> bool:
     method = getattr(module, "quant_method", None)
     backend = getattr(getattr(method, "fp8_backend", None), "name", None)
@@ -65,16 +99,7 @@ def _patchable(module: nn.Module) -> bool:
         return False
     if not getattr(module.moe_config, "is_act_and_mul", False):
         return False
-    _w13, _w2, w13_scale, w2_scale = _live_tensors(module)
-    config = getattr(method, "moe_quant_config", None)
-    # The kernel must read the layer's own scale storage, or writes are unseen.
-    return (
-        config is not None
-        and getattr(config, "w1_scale", None) is not None
-        and getattr(config, "w2_scale", None) is not None
-        and config.w1_scale.data_ptr() == w13_scale.data_ptr()
-        and config.w2_scale.data_ptr() == w2_scale.data_ptr()
-    )
+    return _scale_copies(module) is not None
 
 
 def _module_for(model: nn.Module, prefix: str) -> nn.Module | None:
@@ -102,13 +127,17 @@ def plan_expert_patch(
             continue
         candidates.setdefault(match["prefix"], set()).add(int(match["expert"]))
     groups: dict[str, ExpertGroup] = {}
+    rejected = []
     for prefix, experts in sorted(candidates.items()):
         module = _module_for(model, prefix)
         group = ExpertGroup(module, sorted(experts)) if module is not None else None
         if group is None or not _patchable(module) or not set(group.names(prefix)) <= names:
+            rejected.append(prefix)
             rest.update(n for n in changed if n.startswith(f"{prefix}."))
             continue
         groups[prefix] = group
+    if rejected:
+        logger.info("Expert patch ineligible for %d modules, e.g. %s", len(rejected), rejected[:3])
     return groups, rest
 
 
@@ -127,8 +156,8 @@ def patch_experts(
     method = module.quant_method
     tp_rank = module.moe_config.tp_rank
     tp_size = module.moe_config.moe_parallel_config.tp_size
-    live = _live_tensors(module)
-    pointers = [t.data_ptr() for t in live]
+    targets = _write_targets(module)
+    pointers = [t.data_ptr() for copies in targets for t in copies]
     patched = 0
     for start in range(0, len(experts), _CHUNK):
         chunk = experts[start : start + _CHUNK]
@@ -153,16 +182,17 @@ def patch_experts(
         local = [module._map_global_expert_id_to_local_expert_id(e) for e in chunk]
         if any(e < 0 for e in local):
             raise ExpertPatchError(f"{prefix}: experts {chunk} are not all local")
-        index = torch.tensor(local, dtype=torch.long, device=live[0].device)
-        for target, value in zip(live, converted, strict=True):
-            if value.shape[1:] != target.shape[1:] or value.dtype != target.dtype:
-                raise ExpertPatchError(
-                    f"{prefix}: converted {tuple(value.shape)} {value.dtype} does not "
-                    f"fit live {tuple(target.shape)} {target.dtype}"
-                )
-            target.index_copy_(0, index, value.to(target.device))
+        index = torch.tensor(local, dtype=torch.long, device=targets[0][0].device)
+        for copies, value in zip(targets, converted, strict=True):
+            for target in copies:
+                if value.shape[1:] != target.shape[1:] or value.dtype != target.dtype:
+                    raise ExpertPatchError(
+                        f"{prefix}: converted {tuple(value.shape)} {value.dtype} does not "
+                        f"fit live {tuple(target.shape)} {target.dtype}"
+                    )
+                target.index_copy_(0, index, value.to(target.device))
         patched += len(chunk)
-    if [t.data_ptr() for t in _live_tensors(module)] != pointers:
+    if [t.data_ptr() for copies in _write_targets(module) for t in copies] != pointers:
         raise ExpertPatchError(f"{prefix}: live expert storage changed")
     return patched
 

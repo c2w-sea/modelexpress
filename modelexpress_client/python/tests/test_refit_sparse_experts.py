@@ -218,3 +218,21 @@ def test_sparse_failure_reloads_the_whole_expert_module(fake_vllm, tmp_path, mon
 
     assert model.loads == [sorted(n for n in BASE if n.startswith(PREFIX))]
     assert metrics["perf/mx_receive_surgical_fallback"] == 1
+
+
+def test_sparse_scale_writes_reach_kernel_scale_copies(fake_oracle):
+    model = fakes._Model()
+    module = model.model.layers[0].mlp.experts.routed_experts
+    config = module.quant_method.moe_quant_config
+    config.w2_scale = module.w2_weight_scale_inv.detach().clone()
+    name = f"{PREFIX}.3.down_proj.weight_scale_inv"
+    changes = {name: torch.tensor([[5.0, 6.5]])}
+    target = {**BASE, **changes}
+    plans, _ = plan_sparse_experts(model, changes, changes)
+
+    apply_sparse_experts(PREFIX, plans[PREFIX], _shapes(), changes={}.__getitem__,
+                         target_scale=lambda n: target[n], device=torch.device("cpu"), cache={})
+
+    expected = fakes._expected(target)
+    assert torch.equal(module.w2_weight_scale_inv, expected[3])
+    assert torch.equal(config.w2_scale, expected[3])

@@ -12,6 +12,7 @@ scales are rebuilt and written as absolute values.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 
@@ -27,10 +28,13 @@ from modelexpress_rl.inference.engines.vllm.expert_patch import (
     _live_tensors,
     _module_for,
     _patchable,
+    _write_targets,
 )
 
 _INT_VIEW = {1: torch.uint8, 2: torch.int16, 4: torch.int32}
 _CODE_BITS = 24
+
+logger = logging.getLogger(__name__)
 
 
 class SparseExpertError(RuntimeError):
@@ -69,6 +73,9 @@ def plan_sparse_experts(
         bucket.append(name)
     for prefix in rejected:
         rest.update(n for n in changed if n.startswith(f"{prefix}."))
+    if rejected:
+        logger.info("Sparse expert write ineligible for %d modules, e.g. %s",
+                    len(rejected), sorted(rejected)[:3])
     return plans, rest
 
 
@@ -194,7 +201,8 @@ def apply_sparse_experts(
     module = plan.module
     layout = layout_for(module, shapes, device, cache)
     live = _live_tensors(module)
-    pointers = [t.data_ptr() for t in live]
+    targets = _write_targets(module)
+    pointers = [t.data_ptr() for copies in targets for t in copies]
     written = 0
     batches: dict[int, tuple[list[torch.Tensor], list[torch.Tensor]]] = {0: ([], []), 1: ([], [])}
     for name in plan.weights:
@@ -227,9 +235,10 @@ def apply_sparse_experts(
         mapping = layout.maps[(match["proj"], "weight_scale_inv")]
         keep = torch.nonzero(mapping >= 0, as_tuple=True)[0]
         value = target_scale(name).to(device=device, dtype=torch.float32).reshape(-1)[keep]
-        flat = live[target].view(-1)
-        flat[expert * layout.slots[target] + mapping[keep]] = value.clamp(min=1e-10).to(flat.dtype)
-    if [t.data_ptr() for t in _live_tensors(module)] != pointers:
+        for copy in targets[target]:
+            flat = copy.view(-1)
+            flat[expert * layout.slots[target] + mapping[keep]] = value.clamp(min=1e-10).to(flat.dtype)
+    if [t.data_ptr() for copies in _write_targets(module) for t in copies] != pointers:
         raise SparseExpertError(f"{prefix}: live expert storage changed")
     return written
 

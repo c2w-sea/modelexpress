@@ -262,11 +262,11 @@ def test_plan_splits_routed_expert_tensors_from_other_changes():
     assert patch[PREFIX].module is model.model.layers[0].mlp.experts.routed_experts
 
 
-@pytest.mark.parametrize("reason", ["backend", "scale_reference"])
+@pytest.mark.parametrize("reason", ["backend", "scale_geometry"])
 def test_plan_leaves_unsupported_expert_modules_to_the_module_reload(reason):
     experts = _Experts(backend="DEEPGEMM" if reason == "backend" else "FLASHINFER_TRTLLM")
-    if reason == "scale_reference":
-        experts.quant_method.moe_quant_config.w1_scale = experts.w13_weight_scale_inv.clone()
+    if reason == "scale_geometry":
+        experts.quant_method.moe_quant_config.w1_scale = experts.w13_weight_scale_inv[:, :1].clone()
     changed = {f"{PREFIX}.1.gate_proj.weight"}
 
     patch, rest = plan_expert_patch(_Model(experts), changed, BASE)
@@ -353,3 +353,22 @@ def test_expert_patch_is_opt_in(fake_vllm, tmp_path, monkeypatch):
     _install(tmp_path, model, target, {name})
 
     assert model.loads == [sorted(n for n in BASE if n.startswith(PREFIX))]
+
+
+def test_kernel_scale_copies_left_by_a_reload_are_written_too(fake_vllm, tmp_path):
+    experts = _Experts()
+    config = experts.quant_method.moe_quant_config
+    config.w1_scale = experts.w13_weight_scale_inv.detach().clone()
+    config.w2_scale = experts.w2_weight_scale_inv.detach().clone()
+    name = f"{PREFIX}.2.up_proj.weight_scale_inv"
+    changes = {name: torch.tensor([[33.0], [44.0]])}
+    target = _target(changes)
+    model = _Model(experts)
+
+    metrics = _install(tmp_path, model, target, changes)
+
+    expected = _expected(target)
+    assert metrics["perf/mx_receive_patched_experts"] == 1
+    assert torch.equal(experts.w13_weight_scale_inv, expected[2])
+    assert torch.equal(config.w1_scale, expected[2])
+    assert torch.equal(config.w2_scale, expected[3])
