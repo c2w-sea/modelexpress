@@ -1566,3 +1566,6 @@ Wire-to-engine dtype conversion respects the captured destination slice, strides
 and arena storage offset, including padding surrounding the destination view.
 Bounded staging views are zeroed before each READ so untouched loader padding
 cannot retain bytes from a previous batch or version.
+
+Streaming weight iterators may yield views into reused read buffers, so the vLLM
+adapter copies FP8 indexer `wk` tensors before vLLM buffers them for pairing.
