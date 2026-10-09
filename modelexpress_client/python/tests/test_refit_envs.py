@@ -28,8 +28,6 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_S3_UPLOAD_WORKERS == 8
     assert envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES == 100 * 1024**2
     assert envs.MX_S3_DOWNLOAD_RANGE_BYTES == 8 * 1024**2
-    assert envs.MX_S3_DOWNLOAD_IO_CHUNK_BYTES == 1024**2
-    assert envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS == 16
     assert envs.MX_S3_DOWNLOAD_WORKERS == 16
     assert envs.MX_S3_MAX_POOL_CONNECTIONS == 32
     assert envs.MX_S3_MAX_ATTEMPTS == 5
@@ -51,8 +49,6 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     monkeypatch.setenv("MX_S3_UPLOAD_WORKERS", "4")
     monkeypatch.setenv("MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES", "4096")
     monkeypatch.setenv("MX_S3_DOWNLOAD_RANGE_BYTES", "1024")
-    monkeypatch.setenv("MX_S3_DOWNLOAD_IO_CHUNK_BYTES", "512")
-    monkeypatch.setenv("MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS", "6")
     monkeypatch.setenv("MX_S3_DOWNLOAD_WORKERS", "5")
     monkeypatch.setenv("MX_S3_MAX_POOL_CONNECTIONS", "6")
     monkeypatch.setenv("MX_S3_MAX_ATTEMPTS", "7")
@@ -72,8 +68,6 @@ def test_values_are_normalized_and_read_live(monkeypatch):
     assert envs.MX_S3_UPLOAD_WORKERS == 4
     assert envs.MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES == 4096
     assert envs.MX_S3_DOWNLOAD_RANGE_BYTES == 1024
-    assert envs.MX_S3_DOWNLOAD_IO_CHUNK_BYTES == 512
-    assert envs.MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS == 6
     assert envs.MX_S3_DOWNLOAD_WORKERS == 5
     assert envs.MX_S3_MAX_POOL_CONNECTIONS == 6
     assert envs.MX_S3_MAX_ATTEMPTS == 7
@@ -91,8 +85,6 @@ def test_values_are_normalized_and_read_live(monkeypatch):
         "MX_S3_UPLOAD_WORKERS",
         "MX_S3_DOWNLOAD_RANGE_THRESHOLD_BYTES",
         "MX_S3_DOWNLOAD_RANGE_BYTES",
-        "MX_S3_DOWNLOAD_IO_CHUNK_BYTES",
-        "MX_S3_DOWNLOAD_MAX_IN_MEMORY_CHUNKS",
         "MX_S3_DOWNLOAD_WORKERS",
         "MX_S3_MAX_POOL_CONNECTIONS",
         "MX_S3_MAX_ATTEMPTS",
