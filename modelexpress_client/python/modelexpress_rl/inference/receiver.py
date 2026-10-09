@@ -733,6 +733,7 @@ class _LocalCheckpoint:
             if len(indexes) != 1:
                 return ()
             try:
+                self.store.verify_artifact(self.store.delta_path(delta))
                 index = json.loads(indexes[0].read_text())
             except (OSError, ValueError):
                 return ()
@@ -743,9 +744,10 @@ class _LocalCheckpoint:
             if (
                 not isinstance(weight_map, dict)
                 or not isinstance(metadata, dict)
-                or metadata.get("base_version") != base
             ):
                 return ()
+            # Manifest version labels may be aliases or absent. The validated
+            # cache chain records canonical MX identities for these artifacts.
             changes.append(DeltaChange(base, delta, frozenset(weight_map)))
             base = delta
         return tuple(changes)

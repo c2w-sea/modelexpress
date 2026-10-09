@@ -44,7 +44,7 @@ class _Model(nn.Module):
 
 @pytest.fixture
 def fake_vllm(monkeypatch):
-    state = SimpleNamespace(full=[], incomplete=[], events=[])
+    state = SimpleNamespace(full=[], incomplete=[], events=[], secondary=[])
 
     @contextmanager
     def current_config(_config):
@@ -63,6 +63,7 @@ def fake_vllm(monkeypatch):
         def get_all_weights(self, model_config, _model):
             state.full.append(model_config.model)
             yield from TENSORS.items()
+            yield from state.secondary
 
     names = [
         "vllm",
@@ -197,7 +198,8 @@ def test_incomplete_module_falls_back_to_the_rest_of_the_checkpoint(
     model = _Model()
     installer = _installer(model)
     installer.install(_prepared(path, "v1"))
-    fake_vllm.incomplete.append(nn.Module())
+    model.partial = nn.Module()
+    fake_vllm.incomplete.append(model.partial)
 
     metrics = installer.install(_prepared(path, "v2", V2))
 
@@ -205,6 +207,61 @@ def test_incomplete_module_falls_back_to_the_rest_of_the_checkpoint(
         ["mlp.gate_proj.weight", "mlp.up_proj.weight"],
         ["norm.weight", "other.weight"],
     ]
+    assert metrics["perf/mx_receive_surgical_fallback"] == 1
+
+
+def test_complete_checkpoint_partial_counts_finalize_without_rescanning(
+    fake_vllm, tmp_path, caplog
+):
+    path = _checkpoint(tmp_path)
+    model = _Model()
+    model.partial = nn.Module()
+    fake_vllm.incomplete.append(model.partial)
+    installer = _installer(model)
+    installer.install(_prepared(path, "v1"))
+    fake_vllm.events.clear()
+
+    with caplog.at_level(logging.INFO):
+        metrics = installer.install(
+            _prepared(path, "v2", (DeltaChange("v1", "v2", frozenset(TENSORS)),))
+        )
+
+    assert model.loads == [sorted(TENSORS)]
+    assert fake_vllm.full == [str(path)]
+    assert fake_vllm.events == ["finalize"]
+    assert metrics["perf/mx_receive_surgical_fallback"] == 0
+    assert "partial" in caplog.text
+
+
+def test_foreign_partial_module_does_not_trigger_fallback(fake_vllm, tmp_path):
+    path = _checkpoint(tmp_path)
+    model = _Model()
+    installer = _installer(model)
+    installer.install(_prepared(path, "v1"))
+    fake_vllm.incomplete.append(nn.Module())
+
+    metrics = installer.install(_prepared(path, "v2", V2))
+
+    assert model.loads == [["mlp.gate_proj.weight", "mlp.up_proj.weight"]]
+    assert fake_vllm.full == [str(path)]
+    assert metrics["perf/mx_receive_surgical_fallback"] == 0
+
+
+def test_complete_primary_checkpoint_retains_secondary_fallback(fake_vllm, tmp_path):
+    path = _checkpoint(tmp_path)
+    model = _Model()
+    model.partial = nn.Module()
+    model.secondary_weights = (object(),)
+    fake_vllm.incomplete.append(model.partial)
+    fake_vllm.secondary.append(("aux.weight", torch.tensor([6.0])))
+    installer = _installer(model)
+    installer.install(_prepared(path, "v1"))
+
+    metrics = installer.install(
+        _prepared(path, "v2", (DeltaChange("v1", "v2", frozenset(TENSORS)),))
+    )
+
+    assert model.loads == [sorted(TENSORS), ["aux.weight"]]
     assert metrics["perf/mx_receive_surgical_fallback"] == 1
 
 
@@ -255,3 +312,51 @@ def test_non_checkpoint_install_forgets_live_version(
     installer.install(_prepared(path, "v2", V2))
     assert fake_vllm.full == [str(path), str(path)]
     assert model.loads == []
+
+
+def test_stale_fp8_indexer_entries_are_cleared_before_reload(
+    fake_vllm, tmp_path, caplog
+):
+    path = _checkpoint(tmp_path)
+    model = _Model()
+    seen = []
+    original = model.load_weights
+
+    def load_weights(weights):
+        seen.append(dict(model._pending_indexer_wk_fp8))
+        return original(weights)
+
+    model.load_weights = load_weights
+    installer = _installer(model)
+    installer.install(_prepared(path, "v1"))
+    model._pending_indexer_wk_fp8 = {
+        "model.layers.0.self_attn.indexer": {"weight": torch.zeros(2)}
+    }
+
+    with caplog.at_level(logging.WARNING):
+        installer.install(_prepared(path, "v2", V2))
+
+    assert seen[-1] == {}
+    assert "model.layers.0.self_attn.indexer" in caplog.text
+
+
+def test_reload_fails_when_an_fp8_indexer_pair_is_left_pending(fake_vllm, tmp_path):
+    from modelexpress.refit.reshard.types import IncompleteRefit
+
+    path = _checkpoint(tmp_path)
+    model = _Model()
+    installer = _installer(model)
+    installer.install(_prepared(path, "v1"))
+    original = model.load_weights
+
+    def load_weights(weights):
+        result = original(weights)
+        model._pending_indexer_wk_fp8 = {
+            "model.layers.1.self_attn.indexer": {"scale": torch.ones(1)}
+        }
+        return result
+
+    model.load_weights = load_weights
+
+    with pytest.raises(IncompleteRefit, match="model.layers.1.self_attn.indexer"):
+        installer.install(_prepared(path, "v2", V2))

@@ -1543,3 +1543,17 @@ Wire-to-engine dtype conversion respects the captured destination slice, strides
 and arena storage offset, including padding surrounding the destination view.
 Bounded staging views are zeroed before each READ so untouched loader padding
 cannot retain bytes from a previous batch or version.
+
+Surgical delta installation uses canonical MX version IDs from the validated
+local checkpoint chain. Trainer manifest version labels may be aliases or
+omitted. Cached delta artifacts are verified before their tensor names are used;
+missing or modified artifacts disable surgical lineage and use full installation.
+Incomplete-layer checks are limited to the active model. When all primary
+checkpoint tensors have been selected and there are no secondary weight sources,
+partial element counts are finalized by vLLM without rescanning the checkpoint.
+Partial selections and models with secondary sources retain conservative fallback.
+Diagnostics identify module names, types, and loaded/expected element counts.
+vLLM buffers FP8 indexer `wk` weights and scales across `load_weights` calls until
+both arrive. Every refit reload discards stale buffered entries first and fails
+with `IncompleteRefit` if a pair is still pending afterwards, because the fused
+indexer parameter was then not written.

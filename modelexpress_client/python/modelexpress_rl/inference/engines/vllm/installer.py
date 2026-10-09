@@ -1068,9 +1068,9 @@ class _VllmInstaller(EngineInstaller):
         """Reload only the modules whose checkpoint tensors a delta changed.
 
         Untouched layers receive no weights, so vLLM's finalize places their
-        existing kernel tensors back. If a fed module is still incomplete, the
-        rest of the checkpoint is streamed through the same reload, which is
-        then exactly a full reload.
+        existing kernel tensors back. If a fed module is still incomplete and
+        checkpoint weights remain, stream them through the same reload. Partial
+        counts after complete coverage are left to vLLM finalization.
         """
         from safetensors import safe_open
         from vllm.model_executor.layers.attention import is_deferred_attention_layer
@@ -1100,20 +1100,32 @@ class _VllmInstaller(EngineInstaller):
             nonlocal fallback
             self._model.load_weights(subset())
             incomplete = [
-                type(layer).__name__
-                for layer, info in LAYERWISE_INFO.items()
-                if info.can_load()
+                (name, type(layer).__name__, info.load_numel, info.load_numel_total)
+                for name, layer in self._model.named_modules()
+                if (info := LAYERWISE_INFO.get(layer)) is not None
+                and info.can_load()
                 and 0 < info.load_numel < info.load_numel_total
                 and not is_deferred_attention_layer(layer)
             ]
             if not incomplete:
                 return
+            if names == locations.keys() and not getattr(
+                self._model, "secondary_weights", ()
+            ):
+                logger.info(
+                    "Finalizing %d partial-count modules after complete checkpoint "
+                    "coverage (name, type, loaded, total): %s",
+                    len(incomplete),
+                    incomplete[:5],
+                )
+                return
             fallback = True
             logger.warning(
-                "Surgical checkpoint install left %d modules incomplete (%s); "
+                "Surgical checkpoint install left %d modules incomplete "
+                "(name, type, loaded, total: %s); "
                 "loading the rest of the checkpoint",
                 len(incomplete),
-                sorted(set(incomplete))[:5],
+                incomplete[:5],
             )
             load_config = copy.copy(self._vllm_config.load_config)
             object.__setattr__(load_config, "load_format", "safetensors")
@@ -1396,7 +1408,9 @@ class _VllmInstaller(EngineInstaller):
             initialize_layerwise_reload(self._model)
             self._restore_parameter_aliases(aliases)
             _reserve_runtime_buffer_slots(self._model, LAYERWISE_INFO)
+            _clear_pending_fp8_indexer_wk(self._model)
             load(aliases)
+            _require_no_pending_fp8_indexer_wk(self._model)
             finalize_layerwise_reload(self._model, self._model_config)
             self._validate_alias_owners(aliases)
 
@@ -1435,6 +1449,42 @@ class _VllmInstaller(EngineInstaller):
                 "vLLM refit left parameters on the meta device; "
                 f"count={len(meta_parameters)}, names={meta_parameters[:10]}"
             )
+
+
+# vLLM DeepSeek-V3.2/GLM buffers FP8 indexer wk and its scale here until both
+# arrive; the buffer outlives load_weights, so a stale entry pairs wrongly.
+_PENDING_FP8_INDEXER_WK = "_pending_indexer_wk_fp8"
+
+
+def _describe_pending(pending: dict) -> list[str]:
+    return [
+        f"{prefix}: "
+        + ", ".join(
+            f"{part}={getattr(t, 'dtype', None)}{tuple(getattr(t, 'shape', ()))}"
+            for part, t in sorted(entry.items())
+        )
+        for prefix, entry in sorted(pending.items())
+    ]
+
+
+def _clear_pending_fp8_indexer_wk(model: torch.nn.Module) -> None:
+    pending = getattr(model, _PENDING_FP8_INDEXER_WK, None)
+    if pending:
+        logger.warning(
+            "Discarding %d stale FP8 indexer wk entries before reload: %s",
+            len(pending),
+            _describe_pending(pending),
+        )
+        pending.clear()
+
+
+def _require_no_pending_fp8_indexer_wk(model: torch.nn.Module) -> None:
+    pending = getattr(model, _PENDING_FP8_INDEXER_WK, None)
+    if pending:
+        raise IncompleteRefit(
+            "FP8 indexer wk weight/scale pairs left pending after reload: "
+            f"{_describe_pending(pending)}"
+        )
 
 
 __all__: list[str] = []
