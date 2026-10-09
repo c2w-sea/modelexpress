@@ -1569,3 +1569,6 @@ cannot retain bytes from a previous batch or version.
 
 Streaming weight iterators may yield views into reused read buffers, so the vLLM
 adapter copies FP8 indexer `wk` tensors before vLLM buffers them for pairing.
+After the stream it re-feeds every recorded FP8 indexer `wk` weight together with
+its scale, so each fused indexer parameter is written even if a pair was stranded
+during streaming; a streamed weight without its scale fails the load.
