@@ -61,6 +61,14 @@ def _live_tensors(module: nn.Module) -> list[torch.Tensor]:
     ]
 
 
+def _index_copy(target: torch.Tensor, index: torch.Tensor, value: torch.Tensor) -> None:
+    """``index_copy_`` that also works for FP8, which CUDA does not implement it for."""
+    if target.element_size() == 1:
+        target.view(torch.uint8).index_copy_(0, index, value.view(torch.uint8))
+    else:
+        target.index_copy_(0, index, value)
+
+
 def _scale_copies(module: nn.Module) -> list[list[torch.Tensor]] | None:
     """Every live copy of the w13 and w2 scales.
 
@@ -190,7 +198,7 @@ def patch_experts(
                         f"{prefix}: converted {tuple(value.shape)} {value.dtype} does not "
                         f"fit live {tuple(target.shape)} {target.dtype}"
                     )
-                target.index_copy_(0, index, value.to(target.device))
+                _index_copy(target, index, value.to(target.device))
         patched += len(chunk)
     if [t.data_ptr() for copies in _write_targets(module) for t in copies] != pointers:
         raise ExpertPatchError(f"{prefix}: live expert storage changed")

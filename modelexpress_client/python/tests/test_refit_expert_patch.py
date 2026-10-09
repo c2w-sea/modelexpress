@@ -372,3 +372,23 @@ def test_kernel_scale_copies_left_by_a_reload_are_written_too(fake_vllm, tmp_pat
     assert torch.equal(experts.w13_weight_scale_inv, expected[2])
     assert torch.equal(config.w1_scale, expected[2])
     assert torch.equal(config.w2_scale, expected[3])
+
+
+def test_one_byte_expert_tensors_are_copied_through_byte_views(monkeypatch):
+    from modelexpress_rl.inference.engines.vllm.expert_patch import _index_copy
+
+    original = torch.Tensor.index_copy_
+
+    def cuda_like(self, dim, index, source):
+        if self.dtype == torch.float8_e4m3fn:
+            raise NotImplementedError('"index_copy_cuda" not implemented for Float8_e4m3fn')
+        return original(self, dim, index, source)
+
+    monkeypatch.setattr(torch.Tensor, "index_copy_", cuda_like)
+    target = torch.zeros((3, 2, 2), dtype=torch.uint8).view(torch.float8_e4m3fn)
+    value = torch.full((1, 2, 2), 7, dtype=torch.uint8).view(torch.float8_e4m3fn)
+
+    _index_copy(target, torch.tensor([1]), value)
+
+    assert target.view(torch.uint8)[1].tolist() == [[7, 7], [7, 7]]
+    assert target.view(torch.uint8)[[0, 2]].sum() == 0
