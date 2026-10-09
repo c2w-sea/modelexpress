@@ -13,7 +13,9 @@ by compiled CUDA graphs.
 from __future__ import annotations
 
 import collections
+import contextlib
 import copy
+import itertools
 import hashlib
 import logging
 import mmap
@@ -46,6 +48,10 @@ from modelexpress.refit.timing import refit_span
 
 from modelexpress_rl import envs as rl_envs
 from modelexpress_rl.inference.engines.vllm._capture_snapshot import _CaptureSnapshot
+from modelexpress_rl.inference.engines.vllm.expert_patch import (
+    patch_experts,
+    plan_expert_patch,
+)
 from modelexpress_rl.inference.engines.vllm.stream_windows import (
     layer_windows,
     windowed_weights,
@@ -1182,7 +1188,8 @@ class _VllmInstaller(EngineInstaller):
         checkpoint weights remain, stream them through the same reload. Partial
         counts after complete coverage are left to vLLM finalization. With a
         deferred delta, ``path`` is the parent and the delta's tensors are
-        reconstructed in memory.
+        reconstructed in memory. With expert patching, changed routed experts are
+        written into the live kernel tensors instead of reloading their module.
         """
         from safetensors import safe_open
         from vllm.model_executor.layers.attention import is_deferred_attention_layer
@@ -1194,7 +1201,13 @@ class _VllmInstaller(EngineInstaller):
         packed: dict[str, list[str]] = {}
         for module in self._model.modules():
             packed.update(getattr(module, "packed_modules_mapping", None) or {})
-        names = module_groups(changed, locations, packed)
+        patch, rest = (
+            plan_expert_patch(self._model, changed, locations)
+            if rl_envs.MX_REFIT_DELTA_EXPERT_PATCH
+            else ({}, set(changed))
+        )
+        patch_names = {n for prefix, group in patch.items() for n in group.names(prefix)}
+        names = module_groups(rest, locations, packed) if rest else set()
         by_file: dict[Path, list[str]] = {}
         for name in sorted(
             names, key=lambda n: (str(locations[n][0]), locations[n][1])
@@ -1226,7 +1239,7 @@ class _VllmInstaller(EngineInstaller):
             ]
             if not incomplete:
                 return
-            if names == locations.keys() and not getattr(
+            if names | patch_names == locations.keys() and not getattr(
                 self._model, "secondary_weights", ()
             ):
                 logger.info(
@@ -1260,24 +1273,94 @@ class _VllmInstaller(EngineInstaller):
         layerwise_logger = logging.getLogger(_LAYERWISE_LOGGER)
         layerwise_logger.addFilter(unloaded)
         try:
-            self._reload(load)
+            if names:
+                self._reload(load)
         finally:
             layerwise_logger.removeFilter(unloaded)
+        patched, patch_seconds = 0, 0.0
+        if patch:
+            patch_started = time.perf_counter()
+            patched, failed = self._patch_experts(path, patch, locations, deferred)
+            if failed:
+                fallback = True
+                retry = sorted(module_groups(failed, locations, packed))
+                logger.warning(
+                    "Expert patch failed for %d tensors; reloading their modules",
+                    len(failed),
+                )
+                self._reload(
+                    lambda _aliases: self._model.load_weights(
+                        self._checkpoint_tensors(path, retry, locations, deferred)
+                    )
+                )
+            patch_seconds = time.perf_counter() - patch_started
         with refit_span("post_install"):
             torch.cuda.synchronize(self._device)
         logger.info(
             "Surgical checkpoint install changed=%d loaded=%d untouched_layers=%d "
-            "fallback=%s seconds=%.3f",
+            "fallback=%s patched_experts=%d patch_seconds=%.3f seconds=%.3f",
             len(changed),
             len(names),
             unloaded.count,
             fallback,
+            patched,
+            patch_seconds,
             time.perf_counter() - started,
         )
         return {
             "perf/mx_receive_surgical_tensors": float(len(names)),
             "perf/mx_receive_surgical_fallback": float(fallback),
+            "perf/mx_receive_patched_experts": float(patched),
         }
+
+    def _checkpoint_tensors(
+        self,
+        path: str | Path,
+        names: list[str],
+        locations: dict[str, tuple[Path, int, int]],
+        deferred: DeferredDelta | None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Target checkpoint tensors in ``names`` order."""
+        if deferred is not None:
+            metadata = index_checkpoint_tensors(path)[2]
+            yield from _DeferredOverlay(deferred, locations, metadata).tensors(names)
+            return
+        from safetensors import safe_open
+
+        with contextlib.ExitStack() as stack:
+            handles: dict[Path, Any] = {}
+            for name in names:
+                file = locations[name][0]
+                if file not in handles:
+                    handles[file] = stack.enter_context(safe_open(str(file), framework="pt"))
+                yield name, handles[file].get_tensor(name)
+
+    @torch.no_grad()
+    def _patch_experts(
+        self,
+        path: str | Path,
+        patch: dict,
+        locations: dict[str, tuple[Path, int, int]],
+        deferred: DeferredDelta | None,
+    ) -> tuple[int, list[str]]:
+        """Patch every expert group; return the count and names of failed groups."""
+        ordered = [(prefix, group, group.names(prefix)) for prefix, group in patch.items()]
+        stream = self._checkpoint_tensors(
+            path, [n for _p, _g, names in ordered for n in names], locations, deferred
+        )
+        patched, failed = 0, []
+        with closing(stream):
+            for prefix, group, names in ordered:
+                tensors = itertools.islice(stream, len(names))
+                try:
+                    patched += patch_experts(
+                        group.module, prefix, group.experts, tensors, self._device
+                    )
+                except Exception:
+                    logger.warning("Expert patch failed for %s", prefix, exc_info=True)
+                    failed.extend(names)
+                collections.deque(tensors, maxlen=0)
+        return patched, failed
 
     @torch.no_grad()
     def _process_and_commit(

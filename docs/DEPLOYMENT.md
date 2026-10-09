@@ -754,6 +754,7 @@ See [`K8S_SERVICE_BACKEND.md`](K8S_SERVICE_BACKEND.md) for the design rationale,
 
 | `MX_REFIT_DELTA_SURGICAL` | `false` | Experimental vLLM delta install: reload only the modules whose checkpoint tensors the delta chain changed since the engine's last checkpoint install, instead of the whole prepared checkpoint. Falls back to a full reload when the lineage or live version is unknown, or when a fed module is incomplete. See the S3 delta refit guide. |
 | `MX_REFIT_DELTA_DEFERRED_MATERIALIZE` | `false` | Experimental, requires `MX_REFIT_DELTA_SURGICAL`. A single delta whose base is the cache head is staged without writing a checkpoint: installers reconstruct its tensors in memory from the parent checkpoint, and the target checkpoint is written in the background after every local installer activates. The next preparation waits for that write. |
+| `MX_REFIT_DELTA_EXPERT_PATCH` | `false` | Experimental, requires `MX_REFIT_DELTA_SURGICAL`. Changed routed experts are rebuilt with vLLM's per-rank expert loader and MoE kernel-format conversion and copied into their slots of the live expert tensors, instead of reloading the whole fused MoE module. Only backends whose conversion is independent per expert (FlashInfer TRT-LLM block FP8) are patched, and only when the MoE kernel reads the layer's own scale tensors; other modules, and any expert module whose patch fails, use the module reload. |
 | `MX_REFIT_METADATA_PORT` | `7555` | Base NIXL listen port for an RL generator's refit client; effective port is `MX_REFIT_METADATA_PORT + device_id`, separate from a boot-time loader manager |
 | `MX_WORKER_GRPC_PORT` | `6555` | Base worker gRPC port for P2P tensor and artifact manifest serving |
 | `MX_WORKER_HOST` | (auto-detect) | Override worker IP/hostname for P2P endpoints |
@@ -1568,6 +1569,11 @@ adapter copies FP8 indexer `wk` tensors before vLLM buffers them for pairing.
 After the stream it re-feeds every recorded FP8 indexer `wk` weight together with
 its scale, so each fused indexer parameter is written even if a pair was stranded
 during streaming; a streamed weight without its scale fails the load.
+With expert patching, changed routed experts skip the reload window: after any
+other changed modules are reloaded, each changed expert's six checkpoint tensors
+are loaded into temporary per-rank buffers, converted to the MoE kernel layout,
+and written into the existing expert tensors, so storage pointers captured by CUDA
+graphs are unchanged.
 With deferred materialization, each rank holds a shared installation lock from
 staging until activation or release; the background writer takes the exclusive
 lock, so it starts only after every co-located rank has finished reading the
