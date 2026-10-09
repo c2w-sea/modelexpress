@@ -50,7 +50,7 @@ def _convert(w13, w2, s13, s2):
     half = w13.shape[1] // 2
     w13 = torch.cat([w13[:, half:], w13[:, :half]], 1).transpose(1, 2).contiguous()
     s13 = torch.cat([s13[:, s13.shape[1] // 2 :], s13[:, : s13.shape[1] // 2]], 1)
-    return w13, w2.transpose(1, 2).contiguous(), s13.clamp(min=0.5), s2.clone()
+    return w13, w2.transpose(1, 2).contiguous(), s13.clamp(min=1e-10), s2.clamp(min=1e-10)
 
 
 class _Experts(nn.Module):

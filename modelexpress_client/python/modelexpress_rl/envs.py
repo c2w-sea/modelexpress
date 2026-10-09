@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     MX_REFIT_DELTA_SURGICAL: bool
     MX_REFIT_DELTA_DEFERRED_MATERIALIZE: bool
     MX_REFIT_DELTA_EXPERT_PATCH: bool
+    MX_REFIT_DELTA_SPARSE_WRITE: bool
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
@@ -202,6 +203,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_DELTA_EXPERT_PATCH": lambda: parse_bool(
         os.environ.get("MX_REFIT_DELTA_EXPERT_PATCH", "false"),
         "MX_REFIT_DELTA_EXPERT_PATCH",
+    ),
+    # XOR routed-expert deltas straight into live FusedMoE tensors.
+    "MX_REFIT_DELTA_SPARSE_WRITE": lambda: parse_bool(
+        os.environ.get("MX_REFIT_DELTA_SPARSE_WRITE", "false"),
+        "MX_REFIT_DELTA_SPARSE_WRITE",
     ),
     # One normalized timing record per generator refit. On by default: the
     # durations are already being measured on the staging path, so recording

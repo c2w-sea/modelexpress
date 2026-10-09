@@ -52,6 +52,11 @@ from modelexpress_rl.inference.engines.vllm.expert_patch import (
     patch_experts,
     plan_expert_patch,
 )
+from modelexpress_rl.inference.engines.vllm.sparse_experts import (
+    apply_sparse_experts,
+    plan_sparse_experts,
+    xor_changes,
+)
 from modelexpress_rl.inference.engines.vllm.stream_windows import (
     layer_windows,
     windowed_weights,
@@ -624,6 +629,7 @@ class _VllmInstaller(EngineInstaller):
         # Version whose checkpoint bytes the engine holds; None when unknown.
         self._live_version: str | None = None
         self._capture_cache = None
+        self._sparse_layouts: dict = {}
         self._native_parameter_dispatch = _native_parameter_dispatch()
 
     @cached_property
@@ -1201,12 +1207,18 @@ class _VllmInstaller(EngineInstaller):
         packed: dict[str, list[str]] = {}
         for module in self._model.modules():
             packed.update(getattr(module, "packed_modules_mapping", None) or {})
-        patch, rest = (
-            plan_expert_patch(self._model, changed, locations)
-            if rl_envs.MX_REFIT_DELTA_EXPERT_PATCH
+        sparse, rest = (
+            plan_sparse_experts(self._model, changed, deferred.weight_map)
+            if rl_envs.MX_REFIT_DELTA_SPARSE_WRITE and deferred is not None
             else ({}, set(changed))
         )
+        patch, rest = (
+            plan_expert_patch(self._model, rest, locations)
+            if rl_envs.MX_REFIT_DELTA_EXPERT_PATCH
+            else ({}, rest)
+        )
         patch_names = {n for prefix, group in patch.items() for n in group.names(prefix)}
+        patch_names |= {n for plan in sparse.values() for n in plan.weights + plan.scales}
         names = module_groups(rest, locations, packed) if rest else set()
         by_file: dict[Path, list[str]] = {}
         for name in sorted(
@@ -1294,24 +1306,89 @@ class _VllmInstaller(EngineInstaller):
                     )
                 )
             patch_seconds = time.perf_counter() - patch_started
+        sparse_bytes, sparse_seconds = 0, 0.0
+        if sparse:
+            sparse_started = time.perf_counter()
+            sparse_bytes, failed = self._sparse_experts(path, sparse, locations, deferred)
+            if failed:
+                fallback = True
+                retry = sorted(module_groups(failed, locations, packed))
+                logger.warning(
+                    "Sparse expert write failed for %d tensors; reloading their modules",
+                    len(failed),
+                )
+                self._reload(
+                    lambda _aliases: self._model.load_weights(
+                        self._checkpoint_tensors(path, retry, locations, deferred)
+                    )
+                )
+            sparse_seconds = time.perf_counter() - sparse_started
         with refit_span("post_install"):
             torch.cuda.synchronize(self._device)
         logger.info(
             "Surgical checkpoint install changed=%d loaded=%d untouched_layers=%d "
-            "fallback=%s patched_experts=%d patch_seconds=%.3f seconds=%.3f",
+            "fallback=%s patched_experts=%d patch_seconds=%.3f "
+            "sparse_expert_bytes=%d sparse_seconds=%.3f seconds=%.3f",
             len(changed),
             len(names),
             unloaded.count,
             fallback,
             patched,
             patch_seconds,
+            sparse_bytes,
+            sparse_seconds,
             time.perf_counter() - started,
         )
         return {
             "perf/mx_receive_surgical_tensors": float(len(names)),
             "perf/mx_receive_surgical_fallback": float(fallback),
             "perf/mx_receive_patched_experts": float(patched),
+            "perf/mx_receive_sparse_expert_bytes": float(sparse_bytes),
         }
+
+    @torch.no_grad()
+    def _sparse_experts(
+        self,
+        path: str | Path,
+        sparse: dict,
+        locations: dict[str, tuple[Path, int, int]],
+        deferred: DeferredDelta,
+    ) -> tuple[int, list[str]]:
+        """Write each module's expert deltas in place; return bytes and failed names."""
+        metadata = index_checkpoint_tensors(path)[2]
+        overlay = _DeferredOverlay(deferred, locations, metadata)
+        scales = [n for plan in sparse.values() for n in plan.scales]
+        written, failed = 0, []
+        workers = max(1, rl_envs.MX_REFIT_DELTA_WORKERS)
+        with overlay.opened(scales), ThreadPoolExecutor(
+            workers, thread_name_prefix="modelexpress-sparse"
+        ) as pool:
+            for prefix, plan in sparse.items():
+                shapes = {
+                    (proj, kind): tuple(metadata[f"{prefix}.0.{proj}.{kind}"]["shape"])
+                    for proj in ("gate_proj", "up_proj", "down_proj")
+                    for kind in ("weight", "weight_scale_inv")
+                }
+                try:
+                    changes = dict(
+                        zip(
+                            plan.weights,
+                            pool.map(lambda n: xor_changes(overlay.payload(n)[0]), plan.weights),
+                        )
+                    )
+                    written += apply_sparse_experts(
+                        prefix,
+                        plan,
+                        shapes,
+                        changes=changes.__getitem__,
+                        target_scale=overlay.build,
+                        device=self._device,
+                        cache=self._sparse_layouts,
+                    )
+                except Exception:
+                    logger.warning("Sparse expert write failed for %s", prefix, exc_info=True)
+                    failed.extend(plan.weights + plan.scales)
+        return written, failed
 
     def _checkpoint_tensors(
         self,
@@ -1671,17 +1748,17 @@ class _DeferredOverlay:
         self._shards: dict[str, tuple[dict, int, bytes]] = {}
         self._maps: dict[Path, tuple[Any, mmap.mmap]] = {}
 
-    def _payload(self, name: str) -> tuple[memoryview, str]:
+    def payload(self, name: str) -> tuple[memoryview, str]:
         filename = self._deferred.weight_map[name]
         header, start, data = self._shards[filename]
         begin, end = header[name]["data_offsets"]
         return memoryview(data)[start + begin : start + end], header["__metadata__"][name]
 
-    def _build(self, name: str) -> torch.Tensor:
+    def build(self, name: str) -> torch.Tensor:
         path, offset, size = self._locations[name]
         parent = memoryview(self._maps[path][1])[offset : offset + size]
         if name in self._deferred.weight_map:
-            compressed, checksum = self._payload(name)
+            compressed, checksum = self.payload(name)
             data = reconstruct_delta_tensor(
                 parent,
                 compressed,
@@ -1698,7 +1775,9 @@ class _DeferredOverlay:
             .reshape(info["shape"])
         )
 
-    def tensors(self, names: list[str]) -> Iterator[tuple[str, torch.Tensor]]:
+    @contextlib.contextmanager
+    def opened(self, names: list[str]) -> Iterator[_DeferredOverlay]:
+        """Load the delta shards and map the parent files that ``names`` live in."""
         for filename in set(self._deferred.weight_map.values()):
             data = (self._deferred.artifact / filename).read_bytes()
             header, start = read_safetensors_header(data, repr(filename))
@@ -1707,23 +1786,27 @@ class _DeferredOverlay:
             for path in {self._locations[name][0] for name in names}:
                 handle = path.open("rb")
                 self._maps[path] = (handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ))
-            workers = max(1, rl_envs.MX_REFIT_DELTA_WORKERS)
-            window: collections.deque = collections.deque()
-            with ThreadPoolExecutor(workers, thread_name_prefix="modelexpress-deferred") as pool:
-                for name in names:
-                    window.append((name, pool.submit(self._build, name)))
-                    if len(window) >= 2 * workers:
-                        done, future = window.popleft()
-                        yield done, future.result()
-                while window:
-                    done, future = window.popleft()
-                    yield done, future.result()
+            yield self
         finally:
             for handle, mapped in self._maps.values():
                 mapped.close()
                 handle.close()
             self._maps.clear()
             self._shards.clear()
+
+    def tensors(self, names: list[str]) -> Iterator[tuple[str, torch.Tensor]]:
+        with self.opened(names):
+            workers = max(1, rl_envs.MX_REFIT_DELTA_WORKERS)
+            window: collections.deque = collections.deque()
+            with ThreadPoolExecutor(workers, thread_name_prefix="modelexpress-deferred") as pool:
+                for name in names:
+                    window.append((name, pool.submit(self.build, name)))
+                    if len(window) >= 2 * workers:
+                        done, future = window.popleft()
+                        yield done, future.result()
+                while window:
+                    done, future = window.popleft()
+                    yield done, future.result()
 
 
 # vLLM DeepSeek-V3.2/GLM buffers FP8 indexer wk and its scale here until both

@@ -37,6 +37,7 @@ def test_defaults_when_unset(monkeypatch):
     assert envs.MX_REFIT_DELTA_SURGICAL is False
     assert envs.MX_REFIT_DELTA_DEFERRED_MATERIALIZE is False
     assert envs.MX_REFIT_DELTA_EXPERT_PATCH is False
+    assert envs.MX_REFIT_DELTA_SPARSE_WRITE is False
 
 
 def test_values_are_normalized_and_read_live(monkeypatch):
@@ -169,3 +170,11 @@ def test_delta_expert_patch_parses_boolean(monkeypatch):
     monkeypatch.setenv("MX_REFIT_DELTA_EXPERT_PATCH", "maybe")
     with pytest.raises(ValueError, match="MX_REFIT_DELTA_EXPERT_PATCH"):
         envs.MX_REFIT_DELTA_EXPERT_PATCH
+
+
+def test_delta_sparse_write_parses_boolean(monkeypatch):
+    monkeypatch.setenv("MX_REFIT_DELTA_SPARSE_WRITE", "true")
+    assert envs.MX_REFIT_DELTA_SPARSE_WRITE is True
+    monkeypatch.setenv("MX_REFIT_DELTA_SPARSE_WRITE", "maybe")
+    with pytest.raises(ValueError, match="MX_REFIT_DELTA_SPARSE_WRITE"):
+        envs.MX_REFIT_DELTA_SPARSE_WRITE
