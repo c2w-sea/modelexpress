@@ -13,8 +13,11 @@ scales are rebuilt and written as absolute values.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable, Mapping
+import os
+import time
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -89,6 +92,60 @@ def xor_changes(payload: memoryview | bytes) -> tuple[np.ndarray, np.ndarray]:
     tail = np.flatnonzero(data[whole:]) + whole
     positions = np.concatenate([positions, tail]).astype(np.int64)
     return positions, data[positions]
+
+
+def shared_changes(
+    names: Mapping[str, list[str]],
+    rank: int,
+    world: int,
+    directory: Path,
+    decode: Callable[[str], tuple[np.ndarray, np.ndarray]],
+    timeout: float,
+    map_fn: Callable = map,
+) -> Iterator[tuple[str, dict[str, tuple[np.ndarray, np.ndarray]]]]:
+    """Decode each module once per host and yield every module's changes in order.
+
+    Module k of the sorted prefixes is decoded by rank ``k % world`` and written
+    to ``directory``; other ranks read it. A module whose file does not appear
+    within ``timeout`` raises ``TimeoutError``.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    order = sorted(names)
+    mine: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
+    for k, prefix in enumerate(order):
+        if k % world != rank:
+            continue
+        changes = dict(zip(names[prefix], map_fn(decode, names[prefix])))
+        _write_changes(directory / f"{prefix}.npz", changes, names[prefix])
+        mine[prefix] = changes
+    for prefix in order:
+        if prefix in mine:
+            yield prefix, mine.pop(prefix)
+        else:
+            yield prefix, _read_changes(directory / f"{prefix}.npz", names[prefix], prefix, timeout)
+
+
+def _write_changes(path: Path, changes, order: list[str]) -> None:
+    arrays = {}
+    for i, name in enumerate(order):
+        positions, values = changes[name]
+        arrays[f"p{i}"] = positions.astype(np.int32)
+        arrays[f"v{i}"] = values.astype(np.uint8)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("wb") as handle:
+        np.savez(handle, **arrays)
+    os.replace(temporary, path)
+
+
+def _read_changes(path: Path, order: list[str], prefix: str, timeout: float):
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"shared sparse changes for {prefix} did not appear")
+        time.sleep(0.05)
+    with np.load(path) as data:
+        return {name: (data[f"p{i}"].astype(np.int64), data[f"v{i}"]) for i, name in enumerate(order)}
 
 
 class ExpertLayout:
@@ -243,4 +300,11 @@ def apply_sparse_experts(
     return written
 
 
-__all__ = ["SparseExpertError", "SparsePlan", "apply_sparse_experts", "plan_sparse_experts", "xor_changes"]
+__all__ = [
+    "SparseExpertError",
+    "SparsePlan",
+    "apply_sparse_experts",
+    "plan_sparse_experts",
+    "shared_changes",
+    "xor_changes",
+]

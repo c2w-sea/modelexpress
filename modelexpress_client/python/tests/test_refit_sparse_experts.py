@@ -236,3 +236,49 @@ def test_sparse_scale_writes_reach_kernel_scale_copies(fake_oracle):
     expected = fakes._expected(target)
     assert torch.equal(module.w2_weight_scale_inv, expected[3])
     assert torch.equal(config.w2_scale, expected[3])
+
+
+def test_shared_decode_splits_modules_across_ranks_and_shares_results(tmp_path):
+    import threading
+    from collections import Counter
+
+    from modelexpress_rl.inference.engines.vllm.sparse_experts import shared_changes
+
+    names = {f"p{m}": [f"p{m}.{t}" for t in range(3)] for m in range(5)}
+    decoded = Counter()
+    lock = threading.Lock()
+
+    def decode(name):
+        with lock:
+            decoded[name] += 1
+        seed = sum(map(ord, name))
+        return np.array([seed, seed + 1], dtype=np.int64), np.array([1, 2], dtype=np.uint8)
+
+    results = {}
+
+    def rank(r):
+        results[r] = {prefix: {n: (p.tolist(), v.tolist()) for n, (p, v) in changes.items()}
+                      for prefix, changes in shared_changes(names, r, 2, tmp_path, decode, timeout=10)}
+
+    threads = [threading.Thread(target=rank, args=(r,)) for r in (0, 1)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert set(decoded.values()) == {1} and len(decoded) == 15
+    assert results[0] == results[1]
+    assert list(results[0]) == sorted(names)
+
+
+def test_shared_decode_raises_for_a_module_that_never_appears(tmp_path):
+    from modelexpress_rl.inference.engines.vllm.sparse_experts import shared_changes
+
+    names = {"p0": ["p0.a"], "p1": ["p1.a"]}
+    results = shared_changes(names, 0, 2, tmp_path, lambda n: (np.zeros(0, np.int64), np.zeros(0, np.uint8)),
+                             timeout=0.2)
+
+    prefix, changes = next(results)
+    assert prefix == "p0"
+    with pytest.raises(TimeoutError, match="p1"):
+        next(results)

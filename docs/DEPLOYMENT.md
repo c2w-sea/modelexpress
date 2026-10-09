@@ -1578,7 +1578,9 @@ graphs are unchanged.
 With sparse expert writes, each rank decompresses the changed expert weight
 payloads, keeps the non-zero XOR bytes it owns, maps them to live byte offsets,
 and applies them in place; this relies on the live weights equalling the delta's
-base, which the lineage check establishes.
+base, which the lineage check establishes. When every tensor-parallel rank runs on
+one host, each expert module is decoded once: module k is decoded by local rank
+k mod tp_size and shared through files under the cache's `sparse/` directory.
 With deferred materialization, each rank holds a shared installation lock from
 staging until activation or release; the background writer takes the exclusive
 lock, so it starts only after every co-located rank has finished reading the

@@ -16,6 +16,7 @@ import collections
 import contextlib
 import copy
 import itertools
+import shutil
 import hashlib
 import logging
 import mmap
@@ -55,6 +56,7 @@ from modelexpress_rl.inference.engines.vllm.expert_patch import (
 from modelexpress_rl.inference.engines.vllm.sparse_experts import (
     apply_sparse_experts,
     plan_sparse_experts,
+    shared_changes,
     xor_changes,
 )
 from modelexpress_rl.inference.engines.vllm.stream_windows import (
@@ -1360,34 +1362,61 @@ class _VllmInstaller(EngineInstaller):
         scales = [n for plan in sparse.values() for n in plan.scales]
         written, failed = 0, []
         workers = max(1, rl_envs.MX_REFIT_DELTA_WORKERS)
+        moe_config = next(iter(sparse.values())).module.moe_config
+        rank, world = moe_config.tp_rank, moe_config.moe_parallel_config.tp_size
+        # Ranks share decoding only when they share this host's filesystem.
+        shared = world > 1 and torch.cuda.is_available() and torch.cuda.device_count() >= world
+        logger.info("Sparse expert decode shared=%s rank=%d world=%d", shared, rank, world)
+        names = {prefix: plan.weights for prefix, plan in sparse.items()}
+        done: set[str] = set()
+
+        def decode(name: str):
+            return xor_changes(overlay.payload(name)[0])
+
         with overlay.opened(scales), ThreadPoolExecutor(
             workers, thread_name_prefix="modelexpress-sparse"
         ) as pool:
-            for prefix, plan in sparse.items():
-                shapes = {
-                    (proj, kind): tuple(metadata[f"{prefix}.0.{proj}.{kind}"]["shape"])
-                    for proj in ("gate_proj", "up_proj", "down_proj")
-                    for kind in ("weight", "weight_scale_inv")
-                }
-                try:
-                    changes = dict(
-                        zip(
-                            plan.weights,
-                            pool.map(lambda n: xor_changes(overlay.payload(n)[0]), plan.weights),
+            if shared:
+                directory = deferred.artifact.parent.parent / "sparse" / deferred.artifact.name
+                if rank == 0 and directory.parent.exists():
+                    for stale in directory.parent.iterdir():
+                        if stale != directory:
+                            shutil.rmtree(stale, ignore_errors=True)
+                stream = shared_changes(
+                    names, rank, world, directory, decode, timeout=600, map_fn=pool.map
+                )
+            else:
+                stream = (
+                    (prefix, dict(zip(names[prefix], pool.map(decode, names[prefix]))))
+                    for prefix in sorted(names)
+                )
+            try:
+                for prefix, changes in stream:
+                    plan = sparse[prefix]
+                    done.add(prefix)
+                    shapes = {
+                        (proj, kind): tuple(metadata[f"{prefix}.0.{proj}.{kind}"]["shape"])
+                        for proj in ("gate_proj", "up_proj", "down_proj")
+                        for kind in ("weight", "weight_scale_inv")
+                    }
+                    try:
+                        written += apply_sparse_experts(
+                            prefix,
+                            plan,
+                            shapes,
+                            changes=changes.__getitem__,
+                            target_scale=overlay.build,
+                            device=self._device,
+                            cache=self._sparse_layouts,
                         )
-                    )
-                    written += apply_sparse_experts(
-                        prefix,
-                        plan,
-                        shapes,
-                        changes=changes.__getitem__,
-                        target_scale=overlay.build,
-                        device=self._device,
-                        cache=self._sparse_layouts,
-                    )
-                except Exception:
-                    logger.warning("Sparse expert write failed for %s", prefix, exc_info=True)
-                    failed.extend(plan.weights + plan.scales)
+                    except Exception:
+                        logger.warning("Sparse expert write failed for %s", prefix, exc_info=True)
+                        failed.extend(plan.weights + plan.scales)
+            except Exception:
+                logger.warning("Sparse expert decode stopped", exc_info=True)
+                for prefix, plan in sparse.items():
+                    if prefix not in done:
+                        failed.extend(plan.weights + plan.scales)
         return written, failed
 
     def _checkpoint_tensors(
