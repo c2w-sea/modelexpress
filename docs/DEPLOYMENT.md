@@ -1566,3 +1566,8 @@ Wire-to-engine dtype conversion respects the captured destination slice, strides
 and arena storage offset, including padding surrounding the destination view.
 Bounded staging views are zeroed before each READ so untouched loader padding
 cannot retain bytes from a previous batch or version.
+
+vLLM buffers FP8 indexer `wk` weights and scales across `load_weights` calls until
+both arrive. Every refit reload discards stale buffered entries first and fails
+with `IncompleteRefit` if a pair is still pending afterwards, because the fused
+indexer parameter was then not written.
