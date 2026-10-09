@@ -6,15 +6,17 @@
 from __future__ import annotations
 
 import json
+import logging
 import mmap
 import shutil
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import IO, TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -85,6 +87,19 @@ class DeltaChange:
 
 
 @dataclass(frozen=True)
+class DeferredDelta:
+    """A verified delta whose target is reconstructed in memory at install time.
+
+    ``path`` on the prepared checkpoint is then the read-only parent; the target
+    is written to disk only after every local installer finishes.
+    """
+
+    artifact: Path
+    index_metadata: dict[str, Any]
+    weight_map: dict[str, str]
+
+
+@dataclass(frozen=True)
 class PreparedCheckpoint:
     """One verified host-local checkpoint ready for engine installation."""
 
@@ -93,6 +108,7 @@ class PreparedCheckpoint:
     metrics: dict[str, float]
     # Deltas from the target's full root, oldest first; empty when unknown.
     delta_changes: tuple[DeltaChange, ...] = ()
+    deferred: DeferredDelta | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +120,7 @@ class _S3Version:
 
 
 _S3Manifest = tuple[_S3Version, bytes, dict[str, Any], dict[str, str]]
+logger = logging.getLogger(__name__)
 
 
 def _source_identity(version: _S3Version) -> dict[str, str]:
@@ -122,6 +139,46 @@ def _zstd_stream_reader(data: memoryview) -> Any:
 _DECOMPRESSORS: dict[str, _Decompressor] = {
     "zstd": _zstd_stream_reader,
 }
+
+
+def reconstruct_delta_tensor(
+    parent: memoryview,
+    compressed: memoryview | bytes,
+    *,
+    compression_format: str,
+    checksum_format: str,
+    expected_checksum: str,
+) -> np.ndarray:
+    """XOR one compressed delta onto its parent tensor bytes into a new buffer.
+
+    The parent is only read; one ufunc pass per block copies and XORs it
+    without holding the GIL. The result is verified like an in-place apply.
+    """
+    source = np.frombuffer(parent, dtype=np.uint8)
+    size = source.size
+    target = np.empty(size, dtype=np.uint8)
+    checksum = checksum_factory(checksum_format)
+    reader = _DECOMPRESSORS[compression_format](compressed)
+    position = 0
+    try:
+        while position < size:
+            block = reader.read(min(2 << 20, size - position))
+            if not block:
+                break
+            delta = np.frombuffer(block, dtype=np.uint8)
+            end = position + delta.size
+            region = target[position:end]
+            np.bitwise_xor(source[position:end], delta, out=region)
+            checksum.update(region)
+            position = end
+        extra = reader.read(1) if position == size else b""
+    finally:
+        reader.close()
+    if position != size or extra:
+        raise ValueError("canonical delta byte size differs from its parent tensor")
+    if checksum.hexdigest() != expected_checksum:
+        raise ValueError("canonical reconstructed target checksum differs")
+    return target
 
 
 def _is_safe_shard_basename(value: object) -> bool:
@@ -446,6 +503,9 @@ class _LocalCheckpoint:
         self.checkpoint_paths: list[Path] = []
         self.locations: dict[str, tuple[Path, int, int]] = {}
         self.tensor_metadata: dict[str, dict] = {}
+        # Shared installation locks held from deferred staging until activation.
+        self._deferred_holds: dict[int, IO[str]] = {}
+        self._persistence: threading.Thread | None = None
 
     def initialize(self, *, allow_unrecorded_seed: bool = False) -> bool:
         """Initialize the disk seed, or return False if bootstrap is deferred."""
@@ -648,36 +708,198 @@ class _LocalCheckpoint:
             ):
                 state, _active_version = self._load_ready_state()
                 prepared = self._reuse_prepared_target(state=state, target=target)
-                if prepared is not None:
-                    return prepared
+            if prepared is not None:
+                return self._hold_deferred(prepared)
             with self.store.installation_locked(), self.store.locked():
+                self._settle_deferred_locked()
                 state, active_version = self._load_ready_state()
                 prepared = self._reuse_prepared_target(state=state, target=target)
-                if prepared is not None:
-                    return prepared
-                # P2P can advance the engine without advancing this disk checkpoint.
-                # Choose the replay suffix from the verified cache head under lock.
-                for position, version in enumerate(versions[:-1]):
-                    if version.version_id != state.version:
-                        continue
-                    source = self.store.artifact_source(self._artifact_path(version))
-                    if source is None:
-                        break
-                    if source != _source_identity(version):
-                        raise ValueError("prepared checkpoint has different source identity")
-                    versions = versions[position + 1 :]
-                    break
-                manifests, index_download_time = self._download_replay_manifests(
-                    versions=versions,
-                    target=target,
-                    base_version=state.version,
-                )
-                return self._reconstruct_target(
-                    manifests=manifests,
-                    target=target,
-                    active_version=active_version,
-                    index_download_time=index_download_time,
-                )
+                if prepared is None:
+                    prepared = self._prepare_locked(
+                        versions=versions,
+                        target=target,
+                        state=state,
+                        active_version=active_version,
+                    )
+            return self._hold_deferred(prepared)
+
+    def _prepare_locked(
+        self,
+        *,
+        versions: tuple[_S3Version, ...],
+        target: _S3Version,
+        state: CheckpointRecord,
+        active_version: str,
+    ) -> PreparedCheckpoint:
+        # P2P can advance the engine without advancing this disk checkpoint.
+        # Choose the replay suffix from the verified cache head under lock.
+        for position, version in enumerate(versions[:-1]):
+            if version.version_id != state.version:
+                continue
+            source = self.store.artifact_source(self._artifact_path(version))
+            if source is None:
+                break
+            if source != _source_identity(version):
+                raise ValueError("prepared checkpoint has different source identity")
+            versions = versions[position + 1 :]
+            break
+        manifests, index_download_time = self._download_replay_manifests(
+            versions=versions,
+            target=target,
+            base_version=state.version,
+        )
+        if self._deferred_eligible(manifests, state):
+            return self._stage_deferred(manifests[0], index_download_time)
+        return self._reconstruct_target(
+            manifests=manifests,
+            target=target,
+            active_version=active_version,
+            index_download_time=index_download_time,
+        )
+
+    @staticmethod
+    def _deferred_eligible(
+        manifests: list[_S3Manifest], state: CheckpointRecord
+    ) -> bool:
+        return (
+            rl_envs.MX_REFIT_DELTA_DEFERRED_MATERIALIZE
+            and rl_envs.MX_REFIT_DELTA_SURGICAL
+            and len(manifests) == 1
+            and manifests[0][0].payload_format is WeightPayloadFormat.XOR_DELTA
+            and manifests[0][0].base_version_id == state.version
+        )
+
+    def _stage_deferred(
+        self, manifest: _S3Manifest, index_download_time: float
+    ) -> PreparedCheckpoint:
+        """Download and verify one delta without touching its parent checkpoint."""
+        version, index_data, _metadata, weight_map = manifest
+        download_time = self._download_delta_artifact(version, index_data, weight_map)
+        self.store.write_deferred(
+            {
+                "version": version.version_id,
+                "base": version.base_version_id,
+                "uri": version.uri,
+                "activated": False,
+            }
+        )
+        return self._deferred_prepared(
+            version,
+            base=version.base_version_id,
+            metrics={
+                "perf/mx_receive_delta_index_download": index_download_time,
+                "perf/mx_receive_delta_download": download_time,
+                "perf/mx_receive_delta_apply": 0.0,
+            },
+        )
+
+    def _deferred_prepared(
+        self, target: _S3Version, *, base: str, metrics: dict[str, float]
+    ) -> PreparedCheckpoint:
+        artifact = self.store.delta_path(target.version_id)
+        index = json.loads((artifact / Path(target.uri).name).read_text())
+        changes = ()
+        if rl_envs.MX_REFIT_DELTA_SURGICAL:
+            changes = (
+                *self._delta_changes(base),
+                DeltaChange(base, target.version_id, frozenset(index["weight_map"])),
+            )
+        return PreparedCheckpoint(
+            target_version=target.version_id,
+            path=self.local_checkpoint,
+            metrics=metrics,
+            delta_changes=changes,
+            deferred=DeferredDelta(
+                artifact=artifact,
+                index_metadata=index["metadata"],
+                weight_map=index["weight_map"],
+            ),
+        )
+
+    def _hold_deferred(self, prepared: PreparedCheckpoint) -> PreparedCheckpoint:
+        # Persistence takes the exclusive installation lock, so it waits for
+        # every rank still installing from the parent.
+        if prepared.deferred is not None:
+            self._deferred_holds[id(prepared)] = self.store.hold_installation()
+        return prepared
+
+    def _drop_hold(self, prepared: PreparedCheckpoint) -> None:
+        handle = self._deferred_holds.pop(id(prepared), None)
+        if handle is not None:
+            handle.close()
+
+    def release(self, prepared: PreparedCheckpoint) -> None:
+        """Release a prepared checkpoint that was not activated."""
+        self._drop_hold(prepared)
+
+    def _activate_deferred(self, prepared: PreparedCheckpoint) -> None:
+        with self.store.locked():
+            record = self.store.deferred()
+            if record is None or record["version"] != prepared.target_version:
+                raise ReceiverInstallError("deferred checkpoint changed before activation")
+            record["activated"] = True
+            self.store.write_deferred(record)
+        self._drop_hold(prepared)
+        if self._persistence is None or not self._persistence.is_alive():
+            self._persistence = threading.Thread(
+                target=self._persist_deferred,
+                name="modelexpress-deferred-checkpoint",
+                daemon=True,
+            )
+            self._persistence.start()
+
+    def wait_deferred_persistence(self) -> None:
+        if self._persistence is not None:
+            self._persistence.join()
+
+    def _persist_deferred(self) -> None:
+        try:
+            with self.store.preparation_locked():
+                with self.store.installation_locked(), self.store.locked():
+                    self._settle_deferred_locked()
+        except Exception:
+            logger.exception("Deferred checkpoint persistence failed")
+
+    def _settle_deferred_locked(self) -> None:
+        """Write an activated deferred target, or drop an abandoned one.
+
+        Callers hold the preparation, exclusive installation and cache locks.
+        """
+        record = self.store.deferred()
+        if record is None:
+            return
+        if not record.get("activated"):
+            # The parent was never modified, so the cache remains valid.
+            self.store.clear_deferred()
+            return
+        started = time.perf_counter()
+        _state, active_version = self._load_ready_state()
+        version = _S3Version(
+            version_id=record["version"],
+            base_version_id=record["base"],
+            payload_format=WeightPayloadFormat.XOR_DELTA,
+            uri=record["uri"],
+        )
+        index_data = (
+            self.store.delta_path(version.version_id) / Path(version.uri).name
+        ).read_bytes()
+        metadata, weight_map = _parse_index_manifest(
+            index_data, is_delta=True, version=version
+        )
+        self._reconstruct_target(
+            manifests=[(version, index_data, metadata, weight_map)],
+            target=version,
+            active_version=active_version,
+            index_download_time=0.0,
+        )
+        self.store.activate(version.version_id)
+        self.store.enforce_capacity(protected_versions={version.version_id})
+        self.store.clear_deferred()
+        logger.info(
+            "Deferred checkpoint written version=%s seconds=%.3f",
+            version.version_id,
+            time.perf_counter() - started,
+        )
 
     def _load_ready_state(self) -> tuple[CheckpointRecord, str]:
         state = self.store.state()
@@ -699,6 +921,25 @@ class _LocalCheckpoint:
         state: CheckpointRecord,
         target: _S3Version,
     ) -> PreparedCheckpoint | None:
+        record = self.store.deferred()
+        if (
+            record is not None
+            and record["version"] == target.version_id
+            and record["base"] == state.version
+        ):
+            self.store.verify_artifact_source(
+                self.store.delta_path(target.version_id),
+                _source_identity(target),
+            )
+            return self._deferred_prepared(
+                target,
+                base=record["base"],
+                metrics={
+                    "perf/mx_receive_delta_index_download": 0.0,
+                    "perf/mx_receive_delta_download": 0.0,
+                    "perf/mx_receive_delta_apply": 0.0,
+                },
+            )
         if state.version != target.version_id:
             return None
         delta_changes = self._delta_changes(target.version_id)
@@ -987,6 +1228,15 @@ class _LocalCheckpoint:
                 f"{version.base_version_id!r} is missing"
             )
 
+        download_time = self._download_delta_artifact(version, index_data, weight_map)
+        return download_time, self._apply_delta_version(version, metadata, weight_map, base_chain)
+
+    def _download_delta_artifact(
+        self,
+        version: _S3Version,
+        index_data: bytes,
+        weight_map: dict[str, str],
+    ) -> float:
         artifact = self.store.delta_path(version.version_id)
         download_started = time.perf_counter()
         if artifact.exists():
@@ -1013,8 +1263,16 @@ class _LocalCheckpoint:
                     temporary,
                     source=_source_identity(version),
                 )
-        download_time = time.perf_counter() - download_started
+        return time.perf_counter() - download_started
 
+    def _apply_delta_version(
+        self,
+        version: _S3Version,
+        metadata: dict[str, Any],
+        weight_map: dict[str, str],
+        base_chain: dict,
+    ) -> float:
+        artifact = self.store.delta_path(version.version_id)
         chain = {
             "version": version.version_id,
             "full_version": base_chain["full_version"],
@@ -1054,7 +1312,7 @@ class _LocalCheckpoint:
 
         self._set_local_checkpoint(target)
         self.store.write_chain(version.version_id, chain)
-        return download_time, time.perf_counter() - apply_started
+        return time.perf_counter() - apply_started
 
     def _apply_delta_artifact(
         self,
@@ -1230,6 +1488,18 @@ class _LocalCheckpoint:
     ) -> None:
         """Ensure the prepared checkpoint still matches durable store state."""
         state = self.store.state()
+        if prepared.deferred is not None:
+            record = self.store.deferred()
+            if (
+                state is None
+                or state.status is not CheckpointState.READY
+                or record is None
+                or record["version"] != prepared.target_version
+                or state.version != record["base"]
+                or state.files != checkpoint_files_state(self.checkpoint_paths)
+            ):
+                raise ReceiverInstallError(message)
+            return
         if (
             state is None
             or state.status is not CheckpointState.READY
@@ -1240,6 +1510,9 @@ class _LocalCheckpoint:
 
     def activate(self, prepared: PreparedCheckpoint) -> None:
         """Commit a prepared checkpoint after every local installer succeeds."""
+        if prepared.deferred is not None:
+            self._activate_deferred(prepared)
+            return
         with self.store.installation_locked(), self.store.locked():
             self._validate_prepared(
                 prepared,
@@ -1265,7 +1538,13 @@ class _LocalCheckpoint:
                     message="prepared checkpoint changed before installation",
                 )
                 yield
-            if activate:
+            if activate and prepared.deferred is not None:
+                with self.store.locked(shared=True):
+                    self._validate_prepared(
+                        prepared,
+                        message="prepared checkpoint changed during installation",
+                    )
+            elif activate:
                 with self.store.locked():
                     self._validate_prepared(
                         prepared,
@@ -1275,6 +1554,8 @@ class _LocalCheckpoint:
                     self.store.enforce_capacity(
                         protected_versions={prepared.target_version},
                     )
+        if activate and prepared.deferred is not None:
+            self._activate_deferred(prepared)
 
 
 __all__ = [

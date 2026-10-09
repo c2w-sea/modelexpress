@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     MX_REFIT_CHECKPOINT_DIR: str | None
     MX_REFIT_DELTA_BUCKET_BYTES: int
     MX_REFIT_DELTA_SURGICAL: bool
+    MX_REFIT_DELTA_DEFERRED_MATERIALIZE: bool
     MX_REFIT_DELTA_WORKERS: int
     MX_REFIT_FULL_CHECKPOINT_BATCH_BYTES: int
     MX_REFIT_METADATA_PORT: int
@@ -180,6 +181,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MX_REFIT_DELTA_SURGICAL": lambda: parse_bool(
         os.environ.get("MX_REFIT_DELTA_SURGICAL", "false"),
         "MX_REFIT_DELTA_SURGICAL",
+    ),
+    # Install a single delta from memory; write its checkpoint after install.
+    "MX_REFIT_DELTA_DEFERRED_MATERIALIZE": lambda: parse_bool(
+        os.environ.get("MX_REFIT_DELTA_DEFERRED_MATERIALIZE", "false"),
+        "MX_REFIT_DELTA_DEFERRED_MATERIALIZE",
     ),
     # One normalized timing record per generator refit. On by default: the
     # durations are already being measured on the staging path, so recording
