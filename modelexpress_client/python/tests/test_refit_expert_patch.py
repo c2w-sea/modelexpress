@@ -392,3 +392,15 @@ def test_one_byte_expert_tensors_are_copied_through_byte_views(monkeypatch):
 
     assert target.view(torch.uint8)[1].tolist() == [[7, 7], [7, 7]]
     assert target.view(torch.uint8)[[0, 2]].sum() == 0
+
+
+def test_tensors_of_layers_the_model_does_not_have_are_skipped(fake_vllm, tmp_path):
+    from modelexpress_rl.inference.engines.vllm.surgical import absent_layer_tensors
+
+    model = _Model()
+    names = {f"{PREFIX}.1.up_proj.weight", "model.layers.5.mlp.experts.0.up_proj.weight",
+             "model.layers.5.self_attn.o_proj.weight", "lm_head.weight"}
+
+    assert absent_layer_tensors(model, names) == {
+        "model.layers.5.mlp.experts.0.up_proj.weight", "model.layers.5.self_attn.o_proj.weight"}
+    assert absent_layer_tensors(nn.Module(), names) == set()

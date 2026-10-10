@@ -165,6 +165,7 @@ class ExpertLayout:
         self.maps: dict[tuple[str, str], torch.Tensor] = {}
         for (proj, kind), shape in shapes.items():
             self.maps[(proj, kind)] = self._derive(proj, kind, shape, live)
+        self.owned = {key: torch.nonzero(m >= 0, as_tuple=True)[0] for key, m in self.maps.items()}
 
     def _derive(self, proj, kind, shape, live) -> torch.Tensor:
         numel = int(np.prod(shape))
@@ -250,7 +251,7 @@ def apply_sparse_experts(
     plan: SparsePlan,
     shapes: Mapping[tuple[str, str], tuple[int, ...]],
     changes: Callable[[str], tuple[np.ndarray, np.ndarray]],
-    target_scale: Callable[[str], torch.Tensor],
+    target_scales: Callable[[list[str]], list[torch.Tensor]],
     device: torch.device,
     cache: dict,
 ) -> int:
@@ -261,40 +262,50 @@ def apply_sparse_experts(
     targets = _write_targets(module)
     pointers = [t.data_ptr() for copies in targets for t in copies]
     written = 0
-    batches: dict[int, tuple[list[torch.Tensor], list[torch.Tensor]]] = {0: ([], []), 1: ([], [])}
+    grouped: dict[str, tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]] = {}
     for name in plan.weights:
         match = _EXPERT.match(name)
         expert = module._map_global_expert_id_to_local_expert_id(int(match["expert"]))
         if expert < 0:
             raise SparseExpertError(f"{name} is not local")
-        target = 1 if _SHARD[match["proj"]] == "w2" else 0
-        size = live[target].element_size()
         positions, values = changes(name)
         if positions.size == 0:
             continue
-        pos = torch.from_numpy(positions).to(device)
-        mapped = layout.maps[(match["proj"], "weight")][pos // size]
+        group = grouped.setdefault(match["proj"], ([], [], []))
+        group[0].append(positions)
+        group[1].append(values)
+        group[2].append(np.full(positions.size, expert, dtype=np.int64))
+    for proj, (positions, values, experts) in grouped.items():
+        target = 1 if _SHARD[proj] == "w2" else 0
+        size = live[target].element_size()
+        pos = torch.from_numpy(np.concatenate(positions)).to(device)
+        mapped = layout.maps[(proj, "weight")][pos // size]
         keep = mapped >= 0
-        offsets = (expert * layout.slots[target] + mapped[keep]) * size + pos[keep] % size
-        batches[target][0].append(offsets)
-        batches[target][1].append(torch.from_numpy(values).to(device)[keep])
-    for target, (offsets, values) in batches.items():
-        if not offsets:
-            continue
+        expert = torch.from_numpy(np.concatenate(experts)).to(device)[keep]
+        index = (expert * layout.slots[target] + mapped[keep]) * size + pos[keep] % size
         flat = live[target].view(-1).view(torch.uint8)
-        index = torch.cat(offsets)
-        flat[index] = flat[index] ^ torch.cat(values)
+        flat[index] = flat[index] ^ torch.from_numpy(np.concatenate(values)).to(device)[keep]
         written += index.numel()
-    for name in plan.scales:
+    scale_writes: dict[int, tuple[list[torch.Tensor], list[torch.Tensor]]] = {2: ([], []), 3: ([], [])}
+    rebuilt = target_scales(plan.scales) if plan.scales else []
+    for name, tensor in zip(plan.scales, rebuilt, strict=True):
         match = _EXPERT.match(name)
         expert = module._map_global_expert_id_to_local_expert_id(int(match["expert"]))
+        if expert < 0:
+            raise SparseExpertError(f"{name} is not local")
         target = 3 if _SHARD[match["proj"]] == "w2" else 2
-        mapping = layout.maps[(match["proj"], "weight_scale_inv")]
-        keep = torch.nonzero(mapping >= 0, as_tuple=True)[0]
-        value = target_scale(name).to(device=device, dtype=torch.float32).reshape(-1)[keep]
+        key = (match["proj"], "weight_scale_inv")
+        keep = layout.owned[key]
+        scale_writes[target][0].append(expert * layout.slots[target] + layout.maps[key][keep])
+        scale_writes[target][1].append(tensor.to(device=device, dtype=torch.float32).reshape(-1)[keep])
+    for target, (indices, values) in scale_writes.items():
+        if not indices:
+            continue
+        index = torch.cat(indices)
+        value = torch.cat(values).clamp(min=1e-10)
         for copy in targets[target]:
             flat = copy.view(-1)
-            flat[expert * layout.slots[target] + mapping[keep]] = value.clamp(min=1e-10).to(flat.dtype)
+            flat[index] = value.to(flat.dtype)
     if [t.data_ptr() for copies in _write_targets(module) for t in copies] != pointers:
         raise SparseExpertError(f"{prefix}: live expert storage changed")
     return written

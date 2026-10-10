@@ -18,6 +18,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from modelexpress_rl.inference.receiver import DeltaChange
 
 _EXPERT = re.compile(r"\.experts\.\d+\.[^.]+$")
+_LAYER = re.compile(r"^model\.layers\.(\d+)\.")
 _DEFAULT_PACKED = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
@@ -60,6 +61,15 @@ def module_groups(
     }
 
 
+def absent_layer_tensors(model, names: Iterable[str]) -> set[str]:
+    """Names in decoder layers past the model's layer list, such as unloaded MTP layers."""
+    try:
+        count = len(model.get_submodule("model.layers"))
+    except (AttributeError, TypeError):
+        return set()
+    return {n for n in names if (m := _LAYER.match(n)) and int(m.group(1)) >= count}
+
+
 def changed_since(
     lineage: Sequence[DeltaChange],
     *,
@@ -75,4 +85,4 @@ def changed_since(
     return None
 
 
-__all__ = ["changed_since", "module_groups"]
+__all__ = ["absent_layer_tensors", "changed_since", "module_groups"]

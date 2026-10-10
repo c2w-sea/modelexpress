@@ -64,6 +64,7 @@ from modelexpress_rl.inference.engines.vllm.stream_windows import (
     windowed_weights,
 )
 from modelexpress_rl.inference.engines.vllm.surgical import (
+    absent_layer_tensors,
     changed_since,
     module_groups,
 )
@@ -1209,10 +1210,11 @@ class _VllmInstaller(EngineInstaller):
         packed: dict[str, list[str]] = {}
         for module in self._model.modules():
             packed.update(getattr(module, "packed_modules_mapping", None) or {})
+        absent = absent_layer_tensors(self._model, locations)
         sparse, rest = (
-            plan_sparse_experts(self._model, changed, deferred.weight_map)
+            plan_sparse_experts(self._model, changed - absent, deferred.weight_map)
             if rl_envs.MX_REFIT_DELTA_SPARSE_WRITE and deferred is not None
-            else ({}, set(changed))
+            else ({}, set(changed) - absent)
         )
         patch, rest = (
             plan_expert_patch(self._model, rest, locations)
@@ -1253,7 +1255,7 @@ class _VllmInstaller(EngineInstaller):
             ]
             if not incomplete:
                 return
-            if names | patch_names == locations.keys() and not getattr(
+            if names | patch_names | absent == locations.keys() and not getattr(
                 self._model, "secondary_weights", ()
             ):
                 logger.info(
@@ -1330,7 +1332,7 @@ class _VllmInstaller(EngineInstaller):
         logger.info(
             "Surgical checkpoint install changed=%d loaded=%d untouched_layers=%d "
             "fallback=%s patched_experts=%d patch_seconds=%.3f "
-            "sparse_expert_bytes=%d sparse_seconds=%.3f seconds=%.3f",
+            "sparse_expert_bytes=%d sparse_seconds=%.3f absent_skipped=%d seconds=%.3f",
             len(changed),
             len(names),
             unloaded.count,
@@ -1339,6 +1341,7 @@ class _VllmInstaller(EngineInstaller):
             patch_seconds,
             sparse_bytes,
             sparse_seconds,
+            len(changed & absent),
             time.perf_counter() - started,
         )
         return {
@@ -1405,7 +1408,7 @@ class _VllmInstaller(EngineInstaller):
                             plan,
                             shapes,
                             changes=changes.__getitem__,
-                            target_scale=overlay.build,
+                            target_scales=lambda batch: list(pool.map(overlay.build, batch)),
                             device=self._device,
                             cache=self._sparse_layouts,
                         )

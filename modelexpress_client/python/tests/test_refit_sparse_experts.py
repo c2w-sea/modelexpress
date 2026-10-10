@@ -58,7 +58,7 @@ def _apply(changes):
     written = apply_sparse_experts(
         PREFIX, plans[PREFIX], _shapes(),
         changes=lambda name: xor_changes(payloads[name]),
-        target_scale=lambda name: target[name],
+        target_scales=lambda names: [target[n] for n in names],
         device=torch.device("cpu"), cache={},
     )
     assert [t.data_ptr() for t in fakes._live(model)] == pointers
@@ -231,7 +231,7 @@ def test_sparse_scale_writes_reach_kernel_scale_copies(fake_oracle):
     plans, _ = plan_sparse_experts(model, changes, changes)
 
     apply_sparse_experts(PREFIX, plans[PREFIX], _shapes(), changes={}.__getitem__,
-                         target_scale=lambda n: target[n], device=torch.device("cpu"), cache={})
+                         target_scales=lambda ns: [target[n] for n in ns], device=torch.device("cpu"), cache={})
 
     expected = fakes._expected(target)
     assert torch.equal(module.w2_weight_scale_inv, expected[3])
@@ -282,3 +282,23 @@ def test_shared_decode_raises_for_a_module_that_never_appears(tmp_path):
     assert prefix == "p0"
     with pytest.raises(TimeoutError, match="p1"):
         next(results)
+
+
+def test_module_scales_are_rebuilt_in_one_batch(fake_oracle):
+    names = [f"{PREFIX}.{e}.{p}.weight_scale_inv" for e in (0, 2) for p in ("up_proj", "down_proj")]
+    changes = {n: BASE[n] * 2 for n in names}
+    target = {**BASE, **changes}
+    model = fakes._Model()
+    plans, _ = plan_sparse_experts(model, changes, changes)
+    calls = []
+
+    def build(batch):
+        calls.append(list(batch))
+        return [target[n] for n in batch]
+
+    apply_sparse_experts(PREFIX, plans[PREFIX], _shapes(), changes={}.__getitem__,
+                         target_scales=build, device=torch.device("cpu"), cache={})
+
+    assert len(calls) == 1 and sorted(calls[0]) == sorted(names)
+    for live, expected in zip(fakes._live(model), fakes._expected(target)):
+        assert torch.equal(live, expected)
