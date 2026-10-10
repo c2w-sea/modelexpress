@@ -1376,9 +1376,12 @@ class _VllmInstaller(EngineInstaller):
         def decode(name: str):
             return xor_changes(overlay.payload(name)[0])
 
+        # Separate pools keep scale rebuilds from queueing behind background decoding.
         with overlay.opened(scales), ThreadPoolExecutor(
             workers, thread_name_prefix="modelexpress-sparse"
-        ) as pool:
+        ) as pool, ThreadPoolExecutor(
+            max(1, workers // 4), thread_name_prefix="modelexpress-sparse-scales"
+        ) as scale_pool:
             if shared:
                 directory = deferred.artifact.parent.parent / "sparse" / deferred.artifact.name
                 if rank == 0 and directory.parent.exists():
@@ -1397,7 +1400,7 @@ class _VllmInstaller(EngineInstaller):
 
             def target_scales(batch):
                 begin = time.perf_counter()
-                rebuilt = list(pool.map(overlay.build, batch))
+                rebuilt = list(scale_pool.map(overlay.build, batch))
                 timing["scales"] += time.perf_counter() - begin
                 return rebuilt
 

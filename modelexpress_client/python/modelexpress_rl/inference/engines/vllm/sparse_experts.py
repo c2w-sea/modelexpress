@@ -84,18 +84,15 @@ def plan_sparse_experts(
 
 
 def xor_changes(payload: memoryview | bytes) -> tuple[np.ndarray, np.ndarray]:
-    """Byte positions and XOR values of the non-zero bytes of one zstd payload.
-
-    The scan uses torch, which releases the GIL, so decoder threads run in parallel.
-    """
-    raw = bytearray(zstandard.ZstdDecompressor().decompress(bytes(payload)))
-    data = torch.frombuffer(raw, dtype=torch.uint8) if raw else torch.empty(0, dtype=torch.uint8)
-    whole = data.numel() // 8 * 8
-    words = torch.nonzero(data[:whole].view(torch.int64), as_tuple=True)[0]
-    rows, cols = torch.nonzero(data[:whole].view(-1, 8)[words], as_tuple=True)
-    tail = torch.nonzero(data[whole:], as_tuple=True)[0] + whole
-    positions = torch.cat([words[rows] * 8 + cols, tail])
-    return positions.numpy(), data[positions].numpy()
+    """Byte positions and XOR values of the non-zero bytes of one zstd payload."""
+    data = np.frombuffer(zstandard.ZstdDecompressor().decompress(bytes(payload)), dtype=np.uint8)
+    whole = data.size // 8 * 8
+    words = np.flatnonzero(data[:whole].view(np.uint64))
+    rows, cols = np.nonzero(data[:whole].reshape(-1, 8)[words])
+    positions = words[rows] * 8 + cols
+    tail = np.flatnonzero(data[whole:]) + whole
+    positions = np.concatenate([positions, tail]).astype(np.int64)
+    return positions, data[positions]
 
 
 def shared_changes(
