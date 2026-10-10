@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -83,15 +84,18 @@ def plan_sparse_experts(
 
 
 def xor_changes(payload: memoryview | bytes) -> tuple[np.ndarray, np.ndarray]:
-    """Byte positions and XOR values of the non-zero bytes of one zstd payload."""
-    data = np.frombuffer(zstandard.ZstdDecompressor().decompress(bytes(payload)), dtype=np.uint8)
-    whole = data.size // 8 * 8
-    words = np.flatnonzero(data[:whole].view(np.uint64))
-    rows, cols = np.nonzero(data[:whole].reshape(-1, 8)[words])
-    positions = words[rows] * 8 + cols
-    tail = np.flatnonzero(data[whole:]) + whole
-    positions = np.concatenate([positions, tail]).astype(np.int64)
-    return positions, data[positions]
+    """Byte positions and XOR values of the non-zero bytes of one zstd payload.
+
+    The scan uses torch, which releases the GIL, so decoder threads run in parallel.
+    """
+    raw = bytearray(zstandard.ZstdDecompressor().decompress(bytes(payload)))
+    data = torch.frombuffer(raw, dtype=torch.uint8) if raw else torch.empty(0, dtype=torch.uint8)
+    whole = data.numel() // 8 * 8
+    words = torch.nonzero(data[:whole].view(torch.int64), as_tuple=True)[0]
+    rows, cols = torch.nonzero(data[:whole].view(-1, 8)[words], as_tuple=True)
+    tail = torch.nonzero(data[whole:], as_tuple=True)[0] + whole
+    positions = torch.cat([words[rows] * 8 + cols, tail])
+    return positions.numpy(), data[positions].numpy()
 
 
 def shared_changes(
@@ -113,17 +117,41 @@ def shared_changes(
     directory.mkdir(parents=True, exist_ok=True)
     order = sorted(names)
     mine: dict[str, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
-    for k, prefix in enumerate(order):
-        if k % world != rank:
-            continue
-        changes = dict(zip(names[prefix], map_fn(decode, names[prefix])))
-        _write_changes(directory / f"{prefix}.npz", changes, names[prefix])
-        mine[prefix] = changes
-    for prefix in order:
-        if prefix in mine:
-            yield prefix, mine.pop(prefix)
-        else:
-            yield prefix, _read_changes(directory / f"{prefix}.npz", names[prefix], prefix, timeout)
+    errors: list[BaseException] = []
+    ready = threading.Condition()
+
+    def produce() -> None:
+        try:
+            for k, prefix in enumerate(order):
+                if k % world != rank:
+                    continue
+                changes = dict(zip(names[prefix], map_fn(decode, names[prefix])))
+                _write_changes(directory / f"{prefix}.npz", changes, names[prefix])
+                with ready:
+                    mine[prefix] = changes
+                    ready.notify_all()
+        except BaseException as error:
+            with ready:
+                errors.append(error)
+                ready.notify_all()
+
+    # Own modules decode in the background while earlier modules are applied.
+    producer = threading.Thread(target=produce, name="modelexpress-sparse-decode", daemon=True)
+    producer.start()
+    try:
+        for k, prefix in enumerate(order):
+            if k % world != rank:
+                yield prefix, _read_changes(directory / f"{prefix}.npz", names[prefix], prefix, timeout)
+                continue
+            with ready:
+                if not ready.wait_for(lambda: prefix in mine or errors, timeout):
+                    raise TimeoutError(f"decoding sparse changes for {prefix} timed out")
+                if prefix not in mine:
+                    raise errors[0]
+                changes = mine.pop(prefix)
+            yield prefix, changes
+    finally:
+        producer.join()
 
 
 def _write_changes(path: Path, changes, order: list[str]) -> None:

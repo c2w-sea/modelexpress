@@ -302,3 +302,36 @@ def test_module_scales_are_rebuilt_in_one_batch(fake_oracle):
     assert len(calls) == 1 and sorted(calls[0]) == sorted(names)
     for live, expected in zip(fakes._live(model), fakes._expected(target)):
         assert torch.equal(live, expected)
+
+
+def test_shared_decode_yields_modules_while_later_ones_are_still_decoding(tmp_path):
+    import threading
+
+    from modelexpress_rl.inference.engines.vllm.sparse_experts import shared_changes
+
+    names = {f"p{m}": [f"p{m}.a"] for m in range(3)}
+    first_applied = threading.Event()
+
+    def decode(name):
+        if name.startswith("p1"):
+            assert first_applied.wait(5), "p1 decode blocked: modules are not pipelined"
+        return np.array([1], np.int64), np.array([7], np.uint8)
+
+    stream = shared_changes(names, 0, 1, tmp_path, decode, timeout=5)
+    prefix, _changes = next(stream)
+    assert prefix == "p0"
+    first_applied.set()
+    assert [p for p, _ in stream] == ["p1", "p2"]
+
+
+def test_xor_changes_handles_multi_word_payloads():
+    base = np.zeros(1 << 16, dtype=np.uint8)
+    target = base.copy()
+    changed = [3, 8, 9, 4095, 65530, 65535]
+    target[changed] = [1, 2, 3, 4, 5, 6]
+    delta, _ = compute_delta(target, base)
+
+    positions, values = xor_changes(compress_delta(delta))
+
+    assert positions.tolist() == changed
+    assert values.tolist() == [1, 2, 3, 4, 5, 6]
