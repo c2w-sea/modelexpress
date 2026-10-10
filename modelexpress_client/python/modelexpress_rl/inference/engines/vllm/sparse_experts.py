@@ -166,6 +166,8 @@ class ExpertLayout:
         for (proj, kind), shape in shapes.items():
             self.maps[(proj, kind)] = self._derive(proj, kind, shape, live)
         self.owned = {key: torch.nonzero(m >= 0, as_tuple=True)[0] for key, m in self.maps.items()}
+        # Host copies let each rank drop other ranks' changes before uploading.
+        self.owned_host = {key: (m >= 0).cpu().numpy() for key, m in self.maps.items()}
 
     def _derive(self, proj, kind, shape, live) -> torch.Tensor:
         numel = int(np.prod(shape))
@@ -269,6 +271,9 @@ def apply_sparse_experts(
         if expert < 0:
             raise SparseExpertError(f"{name} is not local")
         positions, values = changes(name)
+        size = live[1 if _SHARD[match["proj"]] == "w2" else 0].element_size()
+        mine = layout.owned_host[(match["proj"], "weight")][positions // size]
+        positions, values = positions[mine], values[mine]
         if positions.size == 0:
             continue
         group = grouped.setdefault(match["proj"], ([], [], []))
@@ -280,11 +285,10 @@ def apply_sparse_experts(
         size = live[target].element_size()
         pos = torch.from_numpy(np.concatenate(positions)).to(device)
         mapped = layout.maps[(proj, "weight")][pos // size]
-        keep = mapped >= 0
-        expert = torch.from_numpy(np.concatenate(experts)).to(device)[keep]
-        index = (expert * layout.slots[target] + mapped[keep]) * size + pos[keep] % size
+        expert = torch.from_numpy(np.concatenate(experts)).to(device)
+        index = (expert * layout.slots[target] + mapped) * size + pos % size
         flat = live[target].view(-1).view(torch.uint8)
-        flat[index] = flat[index] ^ torch.from_numpy(np.concatenate(values)).to(device)[keep]
+        flat[index] = flat[index] ^ torch.from_numpy(np.concatenate(values)).to(device)
         written += index.numel()
     scale_writes: dict[int, tuple[list[torch.Tensor], list[torch.Tensor]]] = {2: ([], []), 3: ([], [])}
     rebuilt = target_scales(plan.scales) if plan.scales else []

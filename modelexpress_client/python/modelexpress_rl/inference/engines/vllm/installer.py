@@ -1393,8 +1393,19 @@ class _VllmInstaller(EngineInstaller):
                     (prefix, dict(zip(names[prefix], pool.map(decode, names[prefix]))))
                     for prefix in sorted(names)
                 )
+            timing = {"decode_wait": 0.0, "scales": 0.0, "apply": 0.0}
+
+            def target_scales(batch):
+                begin = time.perf_counter()
+                rebuilt = list(pool.map(overlay.build, batch))
+                timing["scales"] += time.perf_counter() - begin
+                return rebuilt
+
             try:
+                waited = time.perf_counter()
                 for prefix, changes in stream:
+                    timing["decode_wait"] += time.perf_counter() - waited
+                    applied = time.perf_counter()
                     plan = sparse[prefix]
                     done.add(prefix)
                     shapes = {
@@ -1408,18 +1419,26 @@ class _VllmInstaller(EngineInstaller):
                             plan,
                             shapes,
                             changes=changes.__getitem__,
-                            target_scales=lambda batch: list(pool.map(overlay.build, batch)),
+                            target_scales=target_scales,
                             device=self._device,
                             cache=self._sparse_layouts,
                         )
                     except Exception:
                         logger.warning("Sparse expert write failed for %s", prefix, exc_info=True)
                         failed.extend(plan.weights + plan.scales)
+                    timing["apply"] += time.perf_counter() - applied
+                    waited = time.perf_counter()
             except Exception:
                 logger.warning("Sparse expert decode stopped", exc_info=True)
                 for prefix, plan in sparse.items():
                     if prefix not in done:
                         failed.extend(plan.weights + plan.scales)
+            logger.info(
+                "Sparse expert phases decode_wait=%.3f apply=%.3f scales=%.3f",
+                timing["decode_wait"],
+                timing["apply"],
+                timing["scales"],
+            )
         return written, failed
 
     def _checkpoint_tensors(
